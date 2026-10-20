@@ -566,6 +566,101 @@ resolve_project_roots() {
     return 0
 }
 
+# --- Per-project build output ---
+# Scans never descend into hidden dirs (.git, .nvm, .vscode/extensions…),
+# macOS Library, app bundles or Windows AppData: they hold global installs and
+# editor extensions whose package.json/node_modules are not projects.
+# -mindepth 1 keeps a hidden scan root itself (e.g. ~/.work) from being pruned.
+# ponytail: newline-separated output, paths containing newlines are not supported.
+
+# Echo each top-level node_modules dir that sits next to a package.json.
+# Usage: find_node_modules <root> [<root> ...]
+find_node_modules() {
+    local root dir
+    for root in "$@"; do
+        while IFS= read -r dir; do
+            [ -f "$(dirname "$dir")/package.json" ] && echo "$dir"
+        done < <(find "$root" -mindepth 1 \
+            \( -name '.*' -o -name Library -o -name '*.app' -o -name AppData \) -prune \
+            -o -type d -name node_modules -prune -print 2>/dev/null)
+    done
+    return 0
+}
+
+# Echo .NET build output: bin/ and obj/ next to a *.csproj/*.fsproj/*.vbproj,
+# and .vs/ next to a *.sln. Driven by project files, not folder names, so a
+# Node repo's bin/ scripts dir is never matched (same rule as dev-cleaner.ps1).
+# Usage: find_dotnet_artifacts <root> [<root> ...]
+find_dotnet_artifacts() {
+    local root file dir sub
+    for root in "$@"; do
+        while IFS= read -r file; do
+            dir="$(dirname "$file")"
+            case "$file" in
+                *.sln) [ -d "$dir/.vs" ] && echo "$dir/.vs" ;;
+                *)
+                    for sub in bin obj; do
+                        [ -d "$dir/$sub" ] && echo "$dir/$sub"
+                    done
+                    ;;
+            esac
+        done < <(find "$root" -mindepth 1 \
+            \( -name '.*' -o -name Library -o -name '*.app' -o -name AppData \
+               -o -name node_modules -o -name bin -o -name obj \) -prune \
+            -o -type f \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' -o -name '*.sln' \) -print 2>/dev/null)
+    done | sort -u
+}
+
+# Sum the size (KB) of everything a finder returns for PROJECT_ROOTS. Read-only.
+# Usage: project_paths_kb <finder>
+project_paths_kb() {
+    local paths=() path
+    [ ${#PROJECT_ROOTS[@]} -gt 0 ] || { echo 0; return 0; }
+    while IFS= read -r path; do
+        paths+=("$path")
+    done < <("$1" "${PROJECT_ROOTS[@]}")
+    [ ${#paths[@]} -gt 0 ] || { echo 0; return 0; }
+    du_kb_sum "${paths[@]}"
+}
+
+# Delete everything a finder returns for PROJECT_ROOTS and report counts.
+# A failed deletion is counted and the run continues.
+# Usage: cleanup_project_paths <label> <finder>
+cleanup_project_paths() {
+    local label="$1" finder="$2" path removed=0 failed=0
+    if [ ${#PROJECT_ROOTS[@]} -eq 0 ]; then
+        print_item "✕" "${YELLOW}" "No project directories to scan. Skipping."
+        return 0
+    fi
+    print_item "✓" "${GREEN}" "Removing ${label} under: ${PROJECT_ROOTS[*]}"
+    while IFS= read -r path; do
+        if safe_rm -rf "$path"; then
+            removed=$((removed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <("$finder" "${PROJECT_ROOTS[@]}")
+
+    if [ $((removed + failed)) -eq 0 ]; then
+        print_item "ℹ️" "${YELLOW}" "No ${label} found."
+    elif $DRY_RUN; then
+        print_item "✓" "${GREEN}" "${label}: ${removed} would be removed"
+    elif [ $failed -gt 0 ]; then
+        print_item "⚠️" "${YELLOW}" "${label}: ${removed} removed, ${failed} failed"
+    else
+        print_item "✓" "${GREEN}" "${label}: ${removed} removed"
+    fi
+    return 0
+}
+
+cleanup_node_modules() {
+    cleanup_project_paths "node_modules" find_node_modules
+}
+
+cleanup_dotnet_artifacts() {
+    cleanup_project_paths ".NET build output (bin/obj/.vs)" find_dotnet_artifacts
+}
+
 # --- Cleanup Functions ---
 cleanup_xcode() {
     print_item "✓" "${GREEN}" "Clearing Xcode DerivedData..."
@@ -1383,6 +1478,14 @@ estimate_all() {
         "$HOME/Library/Application Support/Spotify/PersistentCache"/*)
     set_estimate appcontainers "$(human_kb "$kb")"
     total=$((total + kb))
+
+    # Per-project build output is not added to the Clear All total here; see
+    # the Clear All rule for project roots in main_loop().
+    print_item "•" "${FAINT}" "Measuring project node_modules..."
+    set_estimate node_modules "$(human_kb "$(project_paths_kb find_node_modules)")"
+
+    print_item "•" "${FAINT}" "Measuring .NET build output..."
+    set_estimate dotnet "$(human_kb "$(project_paths_kb find_dotnet_artifacts)")"
 
     print_item "•" "${FAINT}" "Counting Time Machine local snapshots..."
     local tm_count

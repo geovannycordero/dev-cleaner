@@ -11,12 +11,12 @@ load test_helper
 @test "executing the script still parses arguments" {
     run bash "$SCRIPT" --version
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Dev Cleaner v${SCRIPT_VERSION}"* ]]
+    [[ "$output" == *"Dev Cleaner v${SCRIPT_VERSION}"* ]] || false
 }
 
 @test "section headers render without a terminal" {
     run env -u TERM -u COLUMNS bash -c "source '$SCRIPT' < /dev/null; print_section_header Test"
     [ "$status" -eq 0 ]
-    [[ "$output" != *tput* ]]
-    [[ "$output" == *"➤ Test"* ]]
+    [[ "$output" != *tput* ]] || false
+    [[ "$output" == *"➤ Test"* ]] || false
 }

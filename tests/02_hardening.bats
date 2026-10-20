@@ -9,7 +9,7 @@ load test_helper
     for p in "" "/" "$HOME" "$HOME/"; do
         run safe_rm -rf "$p"
         [ "$status" -ne 0 ]
-        [[ "$output" == *"Refusing"* ]]
+        [[ "$output" == *"Refusing"* ]] || false
     done
     [ -f "$HOME/keep" ]
 }
@@ -56,7 +56,7 @@ load test_helper
     DRY_RUN=true
     run cleanup_platformIO
     [ "$status" -eq 0 ]
-    [[ "$output" == *"[DRY-RUN] Would run: "*"pio run -t clean -d $HOME/proj"* ]]
+    [[ "$output" == *"[DRY-RUN] Would run: "*"pio run -t clean -d $HOME/proj"* ]] || false
     run ! grep -q "^pio" "$STUB_LOG"
 }
 
@@ -95,7 +95,7 @@ make_build_tools() {
     DRY_RUN=true
     run cleanup_android_sdk
     [ -d "$HOME/Library/Android/sdk/build-tools/30.0.0" ]
-    [[ "$output" == *"Would delete directory: $HOME/Library/Android/sdk/build-tools/30.0.0"* ]]
+    [[ "$output" == *"Would delete directory: $HOME/Library/Android/sdk/build-tools/30.0.0"* ]] || false
 }
 
 @test "cleanup_android_sdk removes x86 emulator images on Apple Silicon via safe_rm" {

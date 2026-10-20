@@ -1,6 +1,8 @@
 # Shared setup: every test gets a throwaway HOME and stubbed external tools,
 # so nothing a test does can reach the real machine.
 bats_require_minimum_version 1.5.0
+# macOS bash 3.2 ignores a failing [[ ]] unless it is the last command of a
+# test, so mid-test [[ ]] assertions end in "|| false".
 SCRIPT="$BATS_TEST_DIRNAME/../dev-cleaner.sh"
 
 setup() {

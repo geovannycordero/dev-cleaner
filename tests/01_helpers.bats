@@ -54,7 +54,7 @@ load test_helper
     RECLAIMED_KB=0
     run tracked_run "$HOME/npmcache" -- npm cache clean --force
     [ "$status" -eq 0 ]
-    [[ "$output" == *"[DRY-RUN] Would run: npm cache clean --force"* ]]
+    [[ "$output" == *"[DRY-RUN] Would run: npm cache clean --force"* ]] || false
     [ ! -s "$STUB_LOG" ]
 }
 

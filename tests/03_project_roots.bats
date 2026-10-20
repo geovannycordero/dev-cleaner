@@ -66,16 +66,16 @@ real() { (cd "$1" && pwd -P); }
     mkdir -p "$HOME/a" "$HOME/b"
     run bash -c "echo n | bash '$SCRIPT' --projects-dir '$HOME/a' --projects-dir '$HOME/b'"
     [ "$status" -eq 0 ]
-    [[ "$output" == *"Project directories:"* ]]
-    [[ "$output" == *"$(real "$HOME/a")"* ]]
-    [[ "$output" == *"$(real "$HOME/b")"* ]]
-    [[ "$output" == *"--projects-dir"* ]]
+    [[ "$output" == *"Project directories:"* ]] || false
+    [[ "$output" == *"$(real "$HOME/a")"* ]] || false
+    [[ "$output" == *"$(real "$HOME/b")"* ]] || false
+    [[ "$output" == *"--projects-dir"* ]] || false
 }
 
 @test "--projects-dir with a missing directory is an error" {
     run bash "$SCRIPT" --projects-dir "$HOME/nope"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"does not exist"* ]]
+    [[ "$output" == *"does not exist"* ]] || false
 }
 
 @test "--projects-dir without a value is an error" {
