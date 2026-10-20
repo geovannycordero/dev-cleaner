@@ -31,6 +31,7 @@ fi
 SCRIPT_VERSION="1.2.0"
 GITHUB_REPO="https://github.com/jemishavasoya/dev-cleaner"
 DRY_RUN=false
+ASSUME_YES=false  # --yes: auto-confirm the safe choice (never forces anything)
 
 # Check if FLUTTER_SEARCH_DIR is already set as environment variable
 if [ -z "${FLUTTER_SEARCH_DIR}" ]; then
@@ -659,6 +660,207 @@ cleanup_node_modules() {
 
 cleanup_dotnet_artifacts() {
     cleanup_project_paths ".NET build output (bin/obj/.vs)" find_dotnet_artifacts
+}
+
+# --- Git worktrees with finished PRs ---
+
+# Ask a y/N question. Enter, EOF or anything but y/Y is "no".
+confirm() {
+    local ans=""
+    echo -e "${YELLOW}$1 (y/N):${NC} \c"
+    read -r ans || true
+    echo ""
+    [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+# Echo "owner/repo" for a GitHub remote URL, nothing for any other host.
+github_slug() {
+    local url="$1" path
+    case "$url" in
+        git@github.com:*) path="${url#git@github.com:}" ;;
+        ssh://git@github.com/*) path="${url#ssh://git@github.com/}" ;;
+        https://github.com/*|https://*@github.com/*) path="${url#*github.com/}" ;;
+        *) return 0 ;;
+    esac
+    path="${path%/}"
+    echo "${path%.git}"
+}
+
+# Echo "<main repo>\t<worktree>\t<branch>" for every linked worktree of every
+# git repo under the given roots. Worktrees living outside the roots are
+# included (their repo is inside). The main worktree, detached HEADs, locked
+# worktrees and prunable ones (directory already gone) are skipped.
+list_worktrees() {
+    local root gitdir repo line wt branch skip first
+    for root in "$@"; do
+        while IFS= read -r gitdir; do
+            repo="$(dirname "$gitdir")"
+            first=true
+            wt="" branch="" skip=false
+            # Porcelain records end with a blank line; the extra echo makes sure
+            # the last one is flushed even if git ever stops printing it.
+            while IFS= read -r line; do
+                case "$line" in
+                    "worktree "*) wt="${line#worktree }" ;;
+                    "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+                    detached|locked|"locked "*|prunable|"prunable "*) skip=true ;;
+                    "")
+                        if ! $first && ! $skip && [ -n "$wt" ] && [ -n "$branch" ]; then
+                            printf '%s\t%s\t%s\n' "$repo" "$wt" "$branch"
+                        fi
+                        [ -n "$wt" ] && first=false
+                        wt="" branch="" skip=false
+                        ;;
+                esac
+            done < <(git -C "$repo" worktree list --porcelain 2>/dev/null; echo)
+        done < <(find "$root" -mindepth 1 \( -name .git -type d -print -prune \) -o \
+            \( -name '.*' -o -name node_modules -o -name Library -o -name '*.app' -o -name AppData \) -prune 2>/dev/null)
+    done
+    return 0
+}
+
+# Echo the state of the latest PR for a branch: MERGED, CLOSED, OPEN, NONE (no
+# PR) or UNKNOWN (gh failed, e.g. offline).
+pr_state() {
+    local state
+    state="$(gh pr list --repo "$1" --head "$2" --state all --limit 1 \
+        --json state --jq '.[0].state // "NONE"' 2>/dev/null)" || state=""
+    echo "${state:-UNKNOWN}"
+}
+
+# Usage: worktree_action <pr_state> <dirty:true|false>
+worktree_action() {
+    if [ "$2" = "true" ]; then
+        echo "skip-dirty"
+        return 0
+    fi
+    case "$1" in
+        MERGED) echo "remove" ;;
+        CLOSED) echo "warn" ;;
+        *) echo "skip" ;;
+    esac
+}
+
+# Echo "<action>\t<pr_state>\t<owner/repo or ->\t<main>\t<worktree>\t<branch>"
+# for every linked worktree under the given roots. Read-only (asks gh).
+collect_worktrees() {
+    local main wt branch slug state dirty
+    while IFS=$'\t' read -r main wt branch; do
+        slug="$(github_slug "$(git -C "$main" remote get-url origin 2>/dev/null)")"
+        state="UNKNOWN"
+        [ -n "$slug" ] && state="$(pr_state "$slug" "$branch")"
+        dirty=false
+        [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && dirty=true
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(worktree_action "$state" "$dirty")" "$state" "${slug:--}" "$main" "$wt" "$branch"
+    done < <(list_worktrees "$@")
+}
+
+gh_ready() {
+    command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+# Remove one worktree and its local branch. A refused removal is only forced
+# after a second, explicit yes; --yes never forces. The branch is deleted with
+# -d, so git keeps it if it is not merged locally (e.g. squash-merged PRs).
+# Usage: remove_worktree <main repo> <worktree> <branch>
+remove_worktree() {
+    local main="$1" wt="$2" branch="$3" kb parent root
+    kb=$(du_kb_sum "$wt")
+    if ! git -C "$main" worktree remove "$wt"; then
+        if $ASSUME_YES; then
+            print_item "✕" "${RED}" "Could not remove $wt (not forced: --yes never forces)."
+            return 1
+        fi
+        confirm "Force removal of $wt? Anything git still has there is lost." || return 1
+        git -C "$main" worktree remove --force "$wt" || return 1
+    fi
+    add_reclaimed_kb "$kb"
+    print_item "✓" "${GREEN}" "Removed worktree: $wt"
+
+    if git -C "$main" branch -d "$branch" >/dev/null 2>&1; then
+        print_item "✓" "${GREEN}" "Deleted branch: $branch"
+    else
+        print_item "ℹ️" "${YELLOW}" "Kept branch $branch: not merged locally (squash merge?). Delete it with: git -C \"$main\" branch -D \"$branch\""
+    fi
+
+    # Tidy a now-empty parent folder (e.g. worksets/<ticket>/). rmdir never
+    # deletes content, and project roots are left alone.
+    parent="$(dirname "$wt")"
+    for root in "${PROJECT_ROOTS[@]}"; do
+        [ "$parent" = "$root" ] && return 0
+    done
+    is_protected_path "$parent" || rmdir "$parent" 2>/dev/null || true
+    return 0
+}
+
+# Offer to remove git worktrees whose GitHub PR is merged (or closed, with a
+# warning). Open, PR-less, non-GitHub and dirty worktrees are never offered.
+cleanup_worktrees() {
+    if ! command -v gh >/dev/null 2>&1; then
+        print_item "✕" "${YELLOW}" "GitHub CLI (gh) not found. Skipping."
+        return 0
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        print_item "✕" "${YELLOW}" "gh is not authenticated (run: gh auth login). Skipping."
+        return 0
+    fi
+    if [ ${#PROJECT_ROOTS[@]} -eq 0 ]; then
+        print_item "✕" "${YELLOW}" "No project directories to scan. Skipping."
+        return 0
+    fi
+
+    print_item "✓" "${GREEN}" "Checking worktrees under: ${PROJECT_ROOTS[*]}"
+    local rows=() row action state slug main wt branch kb prompt
+    while IFS= read -r row; do
+        rows+=("$row")
+    done < <(collect_worktrees "${PROJECT_ROOTS[@]}")
+    if [ ${#rows[@]} -eq 0 ]; then
+        print_item "ℹ️" "${YELLOW}" "No linked worktrees found."
+        return 0
+    fi
+
+    printf "  %-11s %-8s %-28s %s\n" "ACTION" "PR" "REPO" "BRANCH → WORKTREE"
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r action state slug main wt branch <<< "$row"
+        printf "  %-11s %-8s %-28s %s\n" "$action" "$state" "$slug" "$branch → $wt"
+    done
+    echo ""
+
+    local removed=0 skipped=0 failed=0
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r action state slug main wt branch <<< "$row"
+        case "$action" in
+            remove) prompt="Remove worktree $wt (branch $branch, PR merged)?" ;;
+            warn) prompt="The PR for $branch was CLOSED without merging. Remove worktree $wt anyway?" ;;
+            *) skipped=$((skipped + 1)); continue ;;
+        esac
+
+        if $DRY_RUN; then
+            kb=$(du_kb_sum "$wt")
+            add_reclaimed_kb "$kb"
+            echo -e "${YELLOW}[DRY-RUN] Would remove worktree: $wt and branch $branch ($(human_kb "$kb"))${NC}"
+            removed=$((removed + 1))
+            continue
+        fi
+        # --yes only covers merged PRs; a closed one always needs an explicit yes.
+        if ! { [ "$action" = "remove" ] && $ASSUME_YES; } && ! confirm "$prompt"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if remove_worktree "$main" "$wt" "$branch"; then
+            removed=$((removed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    if $DRY_RUN; then
+        print_item "✓" "${GREEN}" "Worktrees: ${removed} would be removed, ${skipped} skipped"
+    else
+        print_item "✓" "${GREEN}" "Worktrees: ${removed} removed, ${skipped} skipped, ${failed} failed"
+    fi
+    return 0
 }
 
 # --- Cleanup Functions ---
@@ -1521,6 +1723,18 @@ estimate_all() {
 
     print_item "•" "${FAINT}" "Measuring .NET build output..."
     set_estimate dotnet "$(human_kb "$(project_paths_kb find_dotnet_artifacts)")"
+
+    # Counted, not measured: deciding needs a gh call per worktree. Never part
+    # of Clear All, so never added to the total.
+    print_item "•" "${FAINT}" "Checking worktree PRs..."
+    if gh_ready; then
+        local wt_count=0
+        [ ${#PROJECT_ROOTS[@]} -gt 0 ] && \
+            wt_count=$(collect_worktrees "${PROJECT_ROOTS[@]}" | grep -cE '^(remove|warn)'$'\t')
+        set_estimate worktrees "~${wt_count:-0} candidate(s)"
+    else
+        set_estimate worktrees "n/a (gh not available)"
+    fi
 
     print_item "•" "${FAINT}" "Counting Time Machine local snapshots..."
     local tm_count
