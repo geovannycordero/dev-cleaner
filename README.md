@@ -135,7 +135,15 @@ irm https://raw.githubusercontent.com/jemishavasoya/dev-cleaner/main/dev-cleaner
 
 # Both custom directories
 .\dev-cleaner.ps1 -FlutterDir "D:\Flutter" -VsDir "D:\VisualStudio"
+
+# Preview node_modules and finished worktrees under your repos
+.\dev-cleaner.ps1 -Only node_modules,worktrees -ProjectsDir "C:\repos" -DryRun
+
+# Unattended run (no menu, no prompts)
+.\dev-cleaner.ps1 -Only npm,nuget,playwright -Yes
 ```
+
+`-DryRun` works with `-Only` for `visualstudio`, `node_modules`, `playwright` and `worktrees`; the script refuses it for cleanups that delete through their own tools.
 
 ##### Environment Variables
 
@@ -143,6 +151,7 @@ irm https://raw.githubusercontent.com/jemishavasoya/dev-cleaner/main/dev-cleaner
 # Set in your PowerShell profile for persistence
 $env:FLUTTER_SEARCH_DIR = "C:\Projects\Flutter"
 $env:VS_SEARCH_DIR = "C:\Projects\DotNet"
+$env:DEV_CLEANER_PROJECT_DIRS = "C:\repos;D:\work"
 ```
 
 ##### Windows-Specific Cleanup
@@ -183,6 +192,8 @@ export DEV_CLEANER_PROJECT_DIRS="$HOME/repos:$HOME/work"
   - **Uncommitted changes:** never offered.
 
   The branch is deleted with `git branch -d`, so git keeps it if it is not merged locally (common after a squash merge) and the script prints the command to delete it. A removal git refuses is only forced after a second yes, never by `--yes`. A folder left empty by the removal is deleted too.
+
+On Windows these are options 17 (`node_modules`), 18 (Playwright) and 19 (worktrees), with `-ProjectsDir`, `-Only`, `-Yes` and `-DryRun`; .NET build output stays option 2 (Visual Studio), which now also covers F# and VB projects.
 
 Scans skip hidden folders (`.nvm`, `.vscode`, …), `Library`, app bundles and `AppData`, which hold global installs and editor extensions. **Clear All** includes options 20–22 but never worktrees, and only cleans `node_modules` and .NET output when project directories were set explicitly, so running it from your home folder cannot wipe every project's dependencies.
 
