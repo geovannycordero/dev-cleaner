@@ -68,7 +68,8 @@ EOF
 # --- Helper Functions ---
 print_header_line() {
     local char="${1:-─}"
-    printf "%$(tput cols)s\n" "" | tr " " "$char"
+    # tput fails without a terminal (pipes, tests); fall back to 80 columns
+    printf "%${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}s\n" "" | tr " " "$char"
 }
 
 print_section_header() {
@@ -1597,6 +1598,9 @@ main_loop() {
     kill "$SUDO_PID" 2>/dev/null
     echo -e "${GREEN}Cleanup session ended.${NC}"
 }
+
+# Sourced (e.g. by the test suite): define the functions above, run nothing.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
 
 # --- Handle command line arguments ---
 while [[ $# -gt 0 ]]; do
