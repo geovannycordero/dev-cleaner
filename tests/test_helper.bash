@@ -1,5 +1,6 @@
 # Shared setup: every test gets a throwaway HOME and stubbed external tools,
 # so nothing a test does can reach the real machine.
+bats_require_minimum_version 1.5.0
 SCRIPT="$BATS_TEST_DIRNAME/../dev-cleaner.sh"
 
 setup() {

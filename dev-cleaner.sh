@@ -373,10 +373,21 @@ tracked_run() {
     return $status
 }
 
+# Paths no cleanup may ever delete, whatever a caller computed (an empty
+# variable turns "$DIR/" into "/", an unset one turns "$HOME/$X" into $HOME).
+is_protected_path() {
+    local p="$1"
+    while [[ "$p" == */ ]]; do p="${p%/}"; done
+    [[ -z "$p" || "$p" == "${HOME%/}" ]]
+}
+
 # Dry-run aware file/directory removal
+# Returns non-zero if any removal failed or was refused, so callers can count
+# failures; the remaining paths are still processed.
 # Usage: safe_rm [-r] <path> [<path> ...]
 safe_rm() {
     local recursive=""
+    local status=0
     local paths=()
     
     # Parse arguments
@@ -394,6 +405,11 @@ safe_rm() {
     done
     
     for path in "${paths[@]}"; do
+        if is_protected_path "$path"; then
+            print_item "✕" "${RED}" "Refusing to delete protected path: '${path}'"
+            status=1
+            continue
+        fi
         # Expand globs and handle paths
         local expanded_paths=()
         # Use nullglob to handle non-matching patterns
@@ -421,14 +437,16 @@ safe_rm() {
                     fi
                 else
                     if [[ -n "$recursive" ]]; then
-                        rm -rf "$expanded_path"
+                        rm -rf -- "$expanded_path" || status=1
                     else
-                        rm -f "$expanded_path"
+                        rm -f -- "$expanded_path" || status=1
                     fi
                 fi
             fi
         done
     done
+
+    return $status
 }
 
 # Dry-run aware sudo file/directory removal
@@ -455,6 +473,11 @@ safe_sudo_rm() {
     done
     
     for path in "${paths[@]}"; do
+        if is_protected_path "$path"; then
+            print_item "✕" "${RED}" "Refusing to delete protected path: '${path}'"
+            status=1
+            continue
+        fi
         # Expand globs and handle paths
         local expanded_paths=()
         shopt -s nullglob
@@ -479,9 +502,9 @@ safe_sudo_rm() {
                     fi
                 else
                     if [[ -n "$recursive" ]]; then
-                        sudo rm -rf "$expanded_path" || status=1
+                        sudo rm -rf -- "$expanded_path" || status=1
                     else
-                        sudo rm -f "$expanded_path" || status=1
+                        sudo rm -f -- "$expanded_path" || status=1
                     fi
                 fi
             fi
@@ -554,16 +577,14 @@ cleanup_android() {
 cleanup_android_sdk() {
     if [ -d "$HOME/Library/Android/sdk" ]; then
         print_item "✓" "${GREEN}" "Cleaning old Android SDK build-tools (keeping latest 2 versions)..."
-        # Keep only latest 2 versions of build-tools
-        if [ -d "$HOME/Library/Android/sdk/build-tools" ]; then
-            cd "$HOME/Library/Android/sdk/build-tools" 2>/dev/null || return
-            if $DRY_RUN; then
-                ls -t | tail -n +3 | while read -r dir; do
-                    echo -e "${YELLOW}[DRY-RUN] Would delete: $HOME/Library/Android/sdk/build-tools/$dir${NC}"
-                done
-            else
-                ls -t | tail -n +3 | xargs -I {} rm -rf {}
-            fi
+        # Keep only latest 2 versions of build-tools (newest first by mtime).
+        # safe_rm handles dry-run and credits the reclaimed space.
+        local build_tools="$HOME/Library/Android/sdk/build-tools" old
+        if [ -d "$build_tools" ]; then
+            # shellcheck disable=SC2012  # version dir names never contain newlines
+            while IFS= read -r old; do
+                [ -n "$old" ] && safe_rm -rf "$build_tools/$old"
+            done < <(ls -t "$build_tools" | tail -n +3)
         fi
 
         print_item "✓" "${GREEN}" "Cleaning old Android platform-tools..."
@@ -572,13 +593,10 @@ cleanup_android_sdk() {
         # For Apple Silicon Macs, remove x86 emulator images if they exist
         if [ "$(uname -m)" = "arm64" ]; then
             print_item "✓" "${GREEN}" "Removing x86 emulator images (ARM Mac detected)..."
-            if $DRY_RUN; then
-                find ~/Library/Android/sdk/system-images -type d -name "x86" 2>/dev/null | while read -r dir; do
-                    echo -e "${YELLOW}[DRY-RUN] Would delete: $dir${NC}"
-                done
-            else
-                find ~/Library/Android/sdk/system-images -type d -name "x86" -exec rm -rf {} + 2>/dev/null || true
-            fi
+            local img
+            while IFS= read -r -d '' img; do
+                safe_rm -rf "$img"
+            done < <(find "$HOME/Library/Android/sdk/system-images" -type d -name "x86" -prune -print0 2>/dev/null)
         fi
     else
         print_item "✕" "${YELLOW}" "Android SDK not found. Skipping."
@@ -683,15 +701,16 @@ cleanup_platformIO() {
 
     print_item "✓" "${GREEN}" "Cleaning PlatformIO project builds (pio run clean)..."
 
-    # Find pubspec.yaml and run 'pio run -t clean' in each directory
-    # -print0 handles spaces/newlines safely
-    find ~/ -maxdepth 4 -type d -name "Library" -prune -o -name "platformio.ini" -print0 | while IFS= read -r -d '' file; do
+    # Find platformio.ini and run 'pio run -t clean' for each project.
+    # -print0 handles spaces/newlines safely; process substitution (not a
+    # pipe) keeps tracked_run's reclaimed-space credit in this shell.
+    # -d targets the project without cd'ing, and tracked_run honours --dry-run.
+    local file dir
+    while IFS= read -r -d '' file; do
         dir="$(dirname "$file")"
         printf 'Running: %s run clean in %s\n' "$PIO_BIN" "$dir"
-
-        # Run in a subshell to avoid changing caller's CWD
-        ( cd "$dir" && "$PIO_BIN" run -t clean )
-    done
+        tracked_run "$dir/.pio/build" -- "$PIO_BIN" run -t clean -d "$dir"
+    done < <(find "$HOME/" -maxdepth 4 -type d -name "Library" -prune -o -name "platformio.ini" -print0)
 }
 
 cleanup_npm_yarn() {
