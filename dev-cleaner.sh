@@ -50,6 +50,13 @@ else
     fi
 fi
 
+# Project roots scanned for per-project build output (node_modules, .NET
+# bin/obj) and git worktrees. Set by resolve_project_roots() after argument
+# parsing: --projects-dir (repeatable) > DEV_CLEANER_PROJECT_DIRS > ".".
+CLI_PROJECT_DIRS=()
+PROJECT_ROOTS=()
+PROJECTS_DIR_SOURCE="default"
+
 # Logo
 print_logo() {
     echo -e "${CYAN}${BOLD}"
@@ -512,6 +519,51 @@ safe_sudo_rm() {
     done
 
     return $status
+}
+
+# --- Project roots ---
+
+# Resolve the directories to scan into PROJECT_ROOTS (absolute, physical).
+# Explicit dirs win over DEV_CLEANER_PROJECT_DIRS (colon-separated), which
+# wins over the current directory. Missing dirs are dropped with a warning;
+# a root nested inside another root is dropped so nothing is scanned (or
+# counted) twice, e.g. ~/repos + ~/repos/worksets -> ~/repos.
+# Usage: resolve_project_roots [<dir> ...]
+resolve_project_roots() {
+    local candidates=() valid=() dir root other keep
+    if [ $# -gt 0 ]; then
+        candidates=("$@")
+        PROJECTS_DIR_SOURCE="command-line"
+    elif [ -n "${DEV_CLEANER_PROJECT_DIRS:-}" ]; then
+        IFS=':' read -r -a candidates <<< "$DEV_CLEANER_PROJECT_DIRS"
+        PROJECTS_DIR_SOURCE="environment"
+    else
+        candidates=(".")
+        PROJECTS_DIR_SOURCE="default"
+    fi
+
+    for dir in "${candidates[@]}"; do
+        [ -n "$dir" ] || continue
+        dir="${dir/#\~/$HOME}"
+        if [ -d "$dir" ]; then
+            valid+=("$(cd "$dir" && pwd -P)")
+        else
+            print_item "⚠️" "${YELLOW}" "Project directory not found, ignoring: $dir" >&2
+        fi
+    done
+
+    PROJECT_ROOTS=()
+    for root in "${valid[@]}"; do
+        keep=true
+        for other in "${valid[@]}"; do
+            [[ "$root" == "$other"/* ]] && keep=false
+        done
+        for other in "${PROJECT_ROOTS[@]}"; do
+            [ "$root" = "$other" ] && keep=false
+        done
+        $keep && PROJECT_ROOTS+=("$root")
+    done
+    return 0
 }
 
 # --- Cleanup Functions ---
@@ -1650,6 +1702,21 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             ;;
+        --projects-dir)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                dir="${2/#\~/$HOME}"
+                if [ ! -d "$dir" ]; then
+                    echo -e "${RED}Error: Project directory does not exist: ${dir}${NC}"
+                    exit 1
+                fi
+                CLI_PROJECT_DIRS+=("$dir")
+                shift 2
+            else
+                echo -e "${RED}Error: --projects-dir requires a directory path${NC}"
+                echo "Use -h or --help for usage information"
+                exit 1
+            fi
+            ;;
         *)
             echo -e "${RED}Error: Unknown option: $1${NC}"
             echo "Use -h or --help for usage information"
@@ -1664,6 +1731,8 @@ if [ "$FLUTTER_SEARCH_DIR" != "." ] && [ ! -d "$FLUTTER_SEARCH_DIR" ]; then
     echo "Please provide a valid directory path."
     exit 1
 fi
+
+resolve_project_roots "${CLI_PROJECT_DIRS[@]}"
 
 # --- Initial check for user confirmation before starting the interactive menu ---
 clear
@@ -1693,6 +1762,22 @@ else
     echo -e "${FAINT}Flutter search directory: current directory (default)${NC}"
     echo ""
 fi
+
+# Report project directories (node_modules, .NET output, worktrees) and their source
+if [ "$PROJECTS_DIR_SOURCE" != "default" ]; then
+    echo -e "${CYAN}Project directories: ${PROJECT_ROOTS[*]}${NC}"
+    case "$PROJECTS_DIR_SOURCE" in
+        "environment")
+            echo -e "${FAINT}  (set via DEV_CLEANER_PROJECT_DIRS environment variable)${NC}"
+            ;;
+        "command-line")
+            echo -e "${FAINT}  (set via --projects-dir command-line argument)${NC}"
+            ;;
+    esac
+else
+    echo -e "${FAINT}Project directories: current directory (default)${NC}"
+fi
+echo ""
 
 if $DRY_RUN; then
     echo -e "${GREEN}✓ Safe to run: No files will be modified in dry-run mode.${NC}"
