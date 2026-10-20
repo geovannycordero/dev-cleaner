@@ -28,7 +28,7 @@ else
 fi
 
 # --- Global Variables ---
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 GITHUB_REPO="https://github.com/jemishavasoya/dev-cleaner"
 DRY_RUN=false
 ASSUME_YES=false  # --yes: auto-confirm the safe choice (never forces anything)
@@ -1436,6 +1436,96 @@ cleanup_docker() {
     fi
 }
 
+# --- Dispatch by stable key ---
+# The same keys as the estimates, so --only keeps working when the menu is
+# renumbered. CLEAR_ALL_KEYS is also the Clear All order; worktrees is never
+# part of it (it asks gh and wants per-item consent).
+CLEAR_ALL_KEYS="xcode android android_sdk flutter platformio npm nuget node_modules dotnet homebrew cocoapods ide system browser cordova electron playwright claude docker appcontainers timemachine"
+CLEANUP_KEYS="$CLEAR_ALL_KEYS worktrees"
+
+# Usage: run_cleanup <key>   (returns 2 for an unknown key)
+run_cleanup() {
+    case "$1" in
+        xcode) cleanup_xcode ;;
+        android) cleanup_android ;;
+        android_sdk) cleanup_android_sdk ;;
+        flutter) cleanup_flutter "$FLUTTER_SEARCH_DIR" ;;
+        platformio) cleanup_platformIO ;;
+        npm) cleanup_npm_yarn ;;
+        nuget) cleanup_nuget ;;
+        node_modules) cleanup_node_modules ;;
+        dotnet) cleanup_dotnet_artifacts ;;
+        homebrew) cleanup_homebrew ;;
+        cocoapods) cleanup_cocoapods ;;
+        ide) cleanup_ide_caches ;;
+        system) cleanup_system_junk ;;
+        browser) cleanup_browser_caches ;;
+        cordova) cleanup_cordova ;;
+        electron) cleanup_electron ;;
+        playwright) cleanup_playwright ;;
+        claude) cleanup_claude_code ;;
+        docker) cleanup_docker ;;
+        appcontainers) cleanup_app_containers ;;
+        timemachine) cleanup_timemachine_snapshots ;;
+        worktrees) cleanup_worktrees ;;
+        *) return 2 ;;
+    esac
+}
+
+# Option 1. Per-project build output only runs when the project roots were
+# set explicitly: a bulk run started from ~ must not recursively wipe every
+# node_modules and bin/obj under the home folder.
+clear_all() {
+    local key
+    for key in $CLEAR_ALL_KEYS; do
+        if [[ "$key" == "node_modules" || "$key" == "dotnet" ]] && [ "$PROJECTS_DIR_SOURCE" = "default" ]; then
+            print_item "✕" "${YELLOW}" "Skipping ${key}: no project directories set (use --projects-dir or DEV_CLEANER_PROJECT_DIRS)."
+            continue
+        fi
+        run_cleanup "$key"
+    done
+}
+
+# --only <key,...>: run the selected cleanups without the menu and exit.
+# Deleting without a terminal needs --yes; --dry-run never does.
+run_only() {
+    local keys=() key needs_sudo=false
+    IFS=',' read -r -a keys <<< "$1"
+    for key in "${keys[@]}"; do
+        if [[ " $CLEANUP_KEYS " != *" $key "* ]]; then
+            echo -e "${RED}Error: Unknown cleanup: ${key}${NC}"
+            echo "Valid cleanups: ${CLEANUP_KEYS// /, }"
+            return 2
+        fi
+        [[ "$key" == "system" || "$key" == "timemachine" ]] && needs_sudo=true
+    done
+
+    if ! $DRY_RUN && ! $ASSUME_YES; then
+        if [ ! -t 0 ]; then
+            echo -e "${RED}Refusing to delete without a terminal to confirm. Pass --yes (or preview with --dry-run).${NC}"
+            return 1
+        fi
+        confirm "Run ${keys[*]}? Deleted files cannot be recovered." || { echo "Cancelled."; return 0; }
+    fi
+    if $needs_sudo; then
+        sudo -v || return 1
+    fi
+
+    RECLAIMED_KB=0
+    HOST_INVISIBLE_KB=0
+    for key in "${keys[@]}"; do
+        print_section_header "Cleaning: ${key}"
+        run_cleanup "$key"
+    done
+    echo ""
+    if $DRY_RUN; then
+        echo -e "${CYAN}Would reclaim: ~$(human_kb "$RECLAIMED_KB")${NC}"
+    else
+        echo -e "${BLUE}Reclaimed: ~$(human_kb "$RECLAIMED_KB")${NC}"
+    fi
+    return 0
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only feature: computes the current on-disk size of what every cleanup
 # option would remove, then display_menu() shows it next to each entry.
@@ -1708,8 +1798,6 @@ estimate_all() {
     set_estimate appcontainers "$(human_kb "$kb")"
     total=$((total + kb))
 
-    # Per-project build output is not added to the Clear All total here; see
-    # the Clear All rule for project roots in main_loop().
     print_item "•" "${FAINT}" "Measuring Playwright browsers..."
     local pw_dir
     pw_dir="$(playwright_cache_dir)"
@@ -1718,11 +1806,17 @@ estimate_all() {
     set_estimate playwright "$(human_kb "$kb")"
     total=$((total + kb))
 
+    # Per-project build output counts toward the Clear All total only when
+    # Clear All would clean it (explicit project roots, see clear_all()).
     print_item "•" "${FAINT}" "Measuring project node_modules..."
-    set_estimate node_modules "$(human_kb "$(project_paths_kb find_node_modules)")"
+    kb=$(project_paths_kb find_node_modules)
+    set_estimate node_modules "$(human_kb "$kb")"
+    [ "$PROJECTS_DIR_SOURCE" != "default" ] && total=$((total + kb))
 
     print_item "•" "${FAINT}" "Measuring .NET build output..."
-    set_estimate dotnet "$(human_kb "$(project_paths_kb find_dotnet_artifacts)")"
+    kb=$(project_paths_kb find_dotnet_artifacts)
+    set_estimate dotnet "$(human_kb "$kb")"
+    [ "$PROJECTS_DIR_SOURCE" != "default" ] && total=$((total + kb))
 
     # Counted, not measured: deciding needs a gh call per worktree. Never part
     # of Clear All, so never added to the total.
@@ -1778,10 +1872,14 @@ display_menu() {
     echo -e "${GREEN}17.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo -e "${GREEN}18.${NC} Clear .NET NuGet Caches (global-packages, http-cache, temp, plugins)$(est nuget)"
     echo -e "${GREEN}19.${NC} Clear old Claude Code versions ${FAINT}(keeps the version in use)${NC}$(est claude)"
+    echo -e "${GREEN}20.${NC} Clear project node_modules ${FAINT}(under project directories)${NC}$(est node_modules)"
+    echo -e "${GREEN}21.${NC} Clear .NET build output ${FAINT}(bin/obj next to projects, .vs next to solutions)${NC}$(est dotnet)"
+    echo -e "${GREEN}22.${NC} Clear Playwright browsers$(est playwright)"
+    echo -e "${GREEN}23.${NC} Remove git worktrees with merged PRs ${FAINT}(asks per worktree; needs gh)${NC}$(est worktrees)"
     echo ""
     echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
     echo ""
-    echo -e "→ Please enter your choice (0-19, or 99 to estimate): ${NC}\c"
+    echo -e "→ Please enter your choice (0-23, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -1798,6 +1896,24 @@ Options:
   --dry-run               Show what would be deleted without actually removing files
   --flutter-dir PATH      Set custom directory for Flutter cleanup (default: current directory)
                           Example: $0 --flutter-dir ~/Projects
+  --projects-dir PATH     Directory to scan for node_modules, .NET build output and git
+                          worktrees (repeatable; default: current directory).
+                          Env: DEV_CLEANER_PROJECT_DIRS="~/repos:~/work"
+  --only KEY[,KEY...]     Run only these cleanups, without the menu, then exit
+  --yes                   Don't ask: confirm --only and remove worktrees whose PR is
+                          merged (closed PRs still ask; failed removals are never forced)
+
+Cleanup keys for --only:
+  ${CLEANUP_KEYS}
+
+Project cleanups:
+  node_modules  node_modules next to a package.json
+  dotnet        bin/ and obj/ next to *.csproj/*.fsproj/*.vbproj, .vs/ next to *.sln
+  worktrees     git worktrees whose GitHub PR is merged (or closed, with a warning);
+                needs an authenticated gh. Never part of "Clear All", and worktrees
+                with uncommitted changes are never offered.
+  Scans skip hidden folders, Library, *.app and AppData. "Clear All" only cleans
+  node_modules and dotnet when project directories were set explicitly.
 
 Command-line Flutter cleanup:
   You can specify a custom directory for Flutter cleanup using the --flutter-dir option.
@@ -1821,6 +1937,9 @@ Examples:
   $0 --dry-run                          # Preview what would be deleted without removing anything
   $0 --flutter-dir ~/Development        # Run with custom Flutter search directory
   $0 --flutter-dir ~/Projects/Flutter   # Search only in specific Flutter projects folder
+  $0 --projects-dir ~/repos             # Scan ~/repos for node_modules, bin/obj and worktrees
+  $0 --only node_modules,dotnet --projects-dir ~/repos --dry-run
+  $0 --only npm,nuget,playwright --yes  # Unattended (e.g. from cron)
 
 Repository: ${GITHUB_REPO}
 EOF
@@ -1853,25 +1972,7 @@ main_loop() {
                 ;;
             1)
                 print_section_header "Performing ALL Cleanup Tasks"
-                cleanup_xcode
-                cleanup_android
-                cleanup_android_sdk
-                cleanup_flutter "$FLUTTER_SEARCH_DIR"
-                cleanup_platformIO
-                cleanup_npm_yarn
-                cleanup_nuget
-                cleanup_homebrew
-                cleanup_cocoapods
-                cleanup_ide_caches
-                cleanup_system_junk
-                cleanup_browser_caches
-                cleanup_cordova
-                cleanup_electron
-                cleanup_playwright
-                cleanup_claude_code
-                cleanup_docker
-                cleanup_app_containers
-                cleanup_timemachine_snapshots
+                clear_all
                 ;;
             2)
                 print_section_header "Performing Xcode Cleanup"
@@ -1986,6 +2087,22 @@ main_loop() {
                 print_section_header "Performing Claude Code Version Cleanup"
                 cleanup_claude_code
                 ;;
+            20)
+                print_section_header "Performing node_modules Cleanup"
+                cleanup_node_modules
+                ;;
+            21)
+                print_section_header "Performing .NET Build Output Cleanup"
+                cleanup_dotnet_artifacts
+                ;;
+            22)
+                print_section_header "Performing Playwright Cleanup"
+                cleanup_playwright
+                ;;
+            23)
+                print_section_header "Performing Worktree Cleanup"
+                cleanup_worktrees
+                ;;
             99)
                 print_section_header "Estimating Reclaimable Space"
                 estimate_all
@@ -1994,7 +2111,7 @@ main_loop() {
                 continue
                 ;;
             *)
-                echo -e "${RED}Invalid choice. Please enter a number between 0 and 19.${NC}"
+                echo -e "${RED}Invalid choice. Please enter a number between 0 and 23.${NC}"
                 sleep 2
                 ;;
         esac
@@ -2043,6 +2160,20 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --yes)
+            ASSUME_YES=true
+            shift
+            ;;
+        --only)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                ONLY_KEYS="$2"
+                shift 2
+            else
+                echo -e "${RED}Error: --only requires one or more cleanup keys (e.g. npm,nuget)${NC}"
+                echo "Use -h or --help for usage information"
+                exit 1
+            fi
+            ;;
         --flutter-dir)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
                 # Expand ~ to home directory
@@ -2086,6 +2217,11 @@ if [ "$FLUTTER_SEARCH_DIR" != "." ] && [ ! -d "$FLUTTER_SEARCH_DIR" ]; then
 fi
 
 resolve_project_roots "${CLI_PROJECT_DIRS[@]}"
+
+if [ -n "${ONLY_KEYS:-}" ]; then
+    run_only "$ONLY_KEYS"
+    exit $?
+fi
 
 # --- Initial check for user confirmation before starting the interactive menu ---
 clear
