@@ -1111,6 +1111,33 @@ cleanup_electron() {
     fi
 }
 
+# Playwright's downloaded browsers (Chromium, Firefox, WebKit; hundreds of MB
+# per version). `npx playwright install` re-downloads them. Echoes nothing when
+# PLAYWRIGHT_BROWSERS_PATH=0, which keeps browsers inside node_modules (the
+# node_modules target covers those).
+playwright_cache_dir() {
+    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
+        [ "$PLAYWRIGHT_BROWSERS_PATH" = "0" ] || echo "${PLAYWRIGHT_BROWSERS_PATH/#\~/$HOME}"
+        return 0
+    fi
+    case "$(uname)" in
+        Darwin) echo "$HOME/Library/Caches/ms-playwright" ;;
+        *) echo "${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright" ;;
+    esac
+}
+
+cleanup_playwright() {
+    local dir
+    dir="$(playwright_cache_dir)"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+        print_item "✓" "${GREEN}" "Cleaning Playwright browsers..."
+        # Wipe contents, keep the dir playwright expects
+        safe_rm -rf "$dir"/*
+    else
+        print_item "✕" "${YELLOW}" "Playwright browsers not found. Skipping."
+    fi
+}
+
 # Prunes ~/.local/share/claude/versions, keeping the version the `claude`
 # launcher points at (plus any binary a running session still has open).
 # Never touches ~/.claude/ or ~/.claude.json: settings, MCP config and
@@ -1481,6 +1508,14 @@ estimate_all() {
 
     # Per-project build output is not added to the Clear All total here; see
     # the Clear All rule for project roots in main_loop().
+    print_item "•" "${FAINT}" "Measuring Playwright browsers..."
+    local pw_dir
+    pw_dir="$(playwright_cache_dir)"
+    kb=0
+    [ -n "$pw_dir" ] && kb=$(du_kb_sum "$pw_dir"/*)
+    set_estimate playwright "$(human_kb "$kb")"
+    total=$((total + kb))
+
     print_item "•" "${FAINT}" "Measuring project node_modules..."
     set_estimate node_modules "$(human_kb "$(project_paths_kb find_node_modules)")"
 
@@ -1618,6 +1653,7 @@ main_loop() {
                 cleanup_browser_caches
                 cleanup_cordova
                 cleanup_electron
+                cleanup_playwright
                 cleanup_claude_code
                 cleanup_docker
                 cleanup_app_containers
