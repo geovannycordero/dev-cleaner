@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# Stand-in for an external tool: records the call, prints canned output if a
-# test provided some in $STUB_OUT_DIR/<name>, and never touches the system.
-name="$(basename "$0")"
-echo "$name $*" >> "${STUB_LOG:-/dev/null}"
-[ -f "${STUB_OUT_DIR:-}/$name" ] && cat "$STUB_OUT_DIR/$name"
-exit 0

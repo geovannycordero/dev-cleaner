@@ -1649,7 +1649,7 @@ function Start-MainLoop {
     }
 }
 
-# Dot-sourced (e.g. by the Pester suite): define the functions above, run nothing.
+# Dot-sourced: define the functions above, run nothing.
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 # --- Entry Point ---

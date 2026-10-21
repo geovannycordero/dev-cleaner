@@ -2140,7 +2140,7 @@ main_loop() {
     echo -e "${GREEN}Cleanup session ended.${NC}"
 }
 
-# Sourced (e.g. by the test suite): define the functions above, run nothing.
+# Sourced: define the functions above, run nothing.
 [[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
 
 # --- Handle command line arguments ---
