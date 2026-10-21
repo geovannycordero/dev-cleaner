@@ -29,7 +29,11 @@ This tool is for **educational purposes**, focusing on safely removing developme
   * iOS CocoaPods caches (`ios/Pods`, `ios/Podfile.lock`, `ios/.symlinks`, Flutter frameworks)
   * Global Flutter cache
 * **AI CLI Tools:** Prunes the old Claude Code binaries the native installer leaves behind (`~/.local/share/claude/versions`, ~190 MB per release), keeping the version in use.
+* **Project Build Output:** Removes `node_modules` and .NET `bin`/`obj`/`.vs` from your project folders, matched by `package.json` and project files so source and script folders are never touched.
+* **Playwright Browsers:** Clears the downloaded Chromium/Firefox/WebKit builds.
+* **Finished Git Worktrees:** Finds worktrees whose GitHub PR was merged and offers to remove them with their branch.
 * **Interactive Menu:** Allows selection of specific cleanup targets (e.g., Xcode only).
+* **Unattended Runs:** `--only npm,nuget --yes` runs selected cleanups without the menu (cron-friendly).
 * **Multi-platform Support:** Supports **macOS**, **Linux**, and **Windows**.
 
 ---
@@ -131,7 +135,15 @@ irm https://raw.githubusercontent.com/jemishavasoya/dev-cleaner/main/dev-cleaner
 
 # Both custom directories
 .\dev-cleaner.ps1 -FlutterDir "D:\Flutter" -VsDir "D:\VisualStudio"
+
+# Preview node_modules and finished worktrees under your repos
+.\dev-cleaner.ps1 -Only node_modules,worktrees -ProjectsDir "C:\repos" -DryRun
+
+# Unattended run (no menu, no prompts)
+.\dev-cleaner.ps1 -Only npm,nuget,playwright -Yes
 ```
+
+`-DryRun` works with `-Only` for `visualstudio`, `node_modules`, `playwright` and `worktrees`; the script refuses it for cleanups that delete through their own tools.
 
 ##### Environment Variables
 
@@ -139,6 +151,7 @@ irm https://raw.githubusercontent.com/jemishavasoya/dev-cleaner/main/dev-cleaner
 # Set in your PowerShell profile for persistence
 $env:FLUTTER_SEARCH_DIR = "C:\Projects\Flutter"
 $env:VS_SEARCH_DIR = "C:\Projects\DotNet"
+$env:DEV_CLEANER_PROJECT_DIRS = "C:\repos;D:\work"
 ```
 
 ##### Windows-Specific Cleanup
@@ -159,6 +172,39 @@ Claude Code's native installer keeps every version it has ever installed under `
 - **Also kept on Windows:** the newest file, since there is no symlink to resolve and an update can land in `versions\` without being copied into `bin\`.
 - **Skipped entirely** — nothing is removed, with a warning — when the launcher is not a symlink into `versions/` (you replaced it with your own script) or points at a version that is no longer on disk. The active version cannot be identified, so nothing is guessed.
 - **Never touched:** `~/.claude/` and `~/.claude.json`. Settings, MCP configuration and session history live there.
+
+#### 📦 Project Build Output, Playwright & Worktrees
+
+Point the script at the folders that hold your repositories with `--projects-dir` (repeatable) or `DEV_CLEANER_PROJECT_DIRS` (colon-separated). It defaults to the current directory; a folder nested inside another one is scanned once.
+
+```bash
+export DEV_CLEANER_PROJECT_DIRS="$HOME/repos:$HOME/work"
+./dev-cleaner.sh --only node_modules,dotnet --dry-run   # preview
+```
+
+- **Option 20 — `node_modules`:** every `node_modules` that sits next to a `package.json`. Nested ones go with their parent.
+- **Option 21 — .NET build output:** `bin/` and `obj/` next to a `*.csproj`/`*.fsproj`/`*.vbproj`, and `.vs/` next to a `*.sln`. A `bin/` folder without a project file (e.g. a Node repo's scripts) is kept.
+- **Option 22 — Playwright browsers:** `~/Library/Caches/ms-playwright` (macOS) or `~/.cache/ms-playwright` (Linux), or `PLAYWRIGHT_BROWSERS_PATH` if set. `npx playwright install` downloads them again.
+- **Option 23 — git worktrees:** asks GitHub (`gh`, must be logged in) about the PR of every linked worktree of every repo it finds:
+  - **Merged:** offered for removal (`--yes` accepts it).
+  - **Closed without merging:** offered with a warning, always asks.
+  - **Open, no PR, not on GitHub:** left alone.
+  - **Uncommitted changes:** never offered.
+
+  The branch is deleted with `git branch -d`, so git keeps it if it is not merged locally (common after a squash merge) and the script prints the command to delete it. A removal git refuses is only forced after a second yes, never by `--yes`. A folder left empty by the removal is deleted too.
+
+On Windows these are options 17 (`node_modules`), 18 (Playwright) and 19 (worktrees), with `-ProjectsDir`, `-Only`, `-Yes` and `-DryRun`; .NET build output stays option 2 (Visual Studio), which now also covers F# and VB projects.
+
+Scans skip hidden folders (`.nvm`, `.vscode`, …), `Library`, app bundles and `AppData`, which hold global installs and editor extensions. **Clear All** includes options 20–22 but never worktrees, and only cleans `node_modules` and .NET output when project directories were set explicitly, so running it from your home folder cannot wipe every project's dependencies.
+
+#### ⏱️ Unattended Runs
+
+`--only` runs the listed cleanups (the same keys `--help` shows) and exits, without the menu. Without a terminal it refuses to delete unless `--yes` is given; `--dry-run` always works.
+
+```bash
+./dev-cleaner.sh --only npm,nuget,playwright --yes
+./dev-cleaner.sh --only worktrees --projects-dir ~/repos --dry-run
+```
 
 #### 🧹 Flutter Cleanup Details
 

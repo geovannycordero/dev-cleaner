@@ -1,7 +1,7 @@
 ﻿# -----------------------------------------------------------------------------
 # Dev Cleanup Utility - Windows PowerShell Edition
 # -----------------------------------------------------------------------------
-# Version: 1.2.0
+# Version: 1.3.0
 # Platform: Windows (PowerShell 5.1+)
 # Repository: https://github.com/jemishavasoya/dev-cleaner
 # -----------------------------------------------------------------------------
@@ -10,15 +10,29 @@ param(
     [switch]$Help,
     [switch]$Version,
     [string]$FlutterDir,
-    [string]$VsDir
+    [string]$VsDir,
+    [string[]]$ProjectsDir,
+    [string]$Only,
+    [switch]$Yes,
+    [switch]$DryRun
 )
 
 # --- Global Variables ---
-$SCRIPT_VERSION = "1.2.0"
+$SCRIPT_VERSION = "1.3.0"
 $GITHUB_REPO = "https://github.com/jemishavasoya/dev-cleaner"
 
 # --- Error Tracking ---
 $script:FailedItems = [System.Collections.ArrayList]::new()
+
+# --- Run mode ---
+# -DryRun is honoured by Remove-SafelyWithTracking and the worktree cleanup;
+# Invoke-Only refuses it for cleanups that delete through their own tools.
+$script:DryRun = [bool]$DryRun
+$script:AssumeYes = [bool]$Yes  # -Yes: confirm the safe choice, never force
+
+# Project roots for node_modules and worktree scans (see Resolve-ProjectRoots)
+$script:ProjectRoots = @()
+$script:ProjectsDirSource = "default"
 
 # --- Estimation state ---
 $script:Estimates = @{}
@@ -158,6 +172,10 @@ function Request-Elevation {
 
         if ($FlutterDir) { $arguments += " -FlutterDir `"$FlutterDir`"" }
         if ($VsDir) { $arguments += " -VsDir `"$VsDir`"" }
+        foreach ($d in $ProjectsDir) { $arguments += " -ProjectsDir `"$d`"" }
+        if ($Only) { $arguments += " -Only `"$Only`"" }
+        if ($Yes) { $arguments += " -Yes" }
+        if ($DryRun) { $arguments += " -DryRun" }
 
         Start-Process PowerShell -Verb RunAs -ArgumentList $arguments
         exit
@@ -172,9 +190,25 @@ function Remove-SafelyWithTracking {
         [string]$Description
     )
 
+    # Never delete these, whatever a caller computed (an empty variable turns
+    # "$dir\" into "\", an unset one turns "$HOME\$x" into $HOME).
+    $trimmed = "$Path".TrimEnd('\', '/')
+    if (-not $trimmed -or $trimmed -eq $HOME.TrimEnd('\', '/') -or $trimmed -match '^[A-Za-z]:$') {
+        Write-Item "✕" "Red" "Refusing to delete protected path: '$Path'"
+        $script:FailedItems.Add([PSCustomObject]@{
+            Path = $Path
+            Reason = "Protected path"
+        }) | Out-Null
+        return
+    }
+
     try {
-        if (Test-Path $Path) {
-            Remove-Item -Path $Path -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $Path) {
+            if ($script:DryRun) {
+                Write-Item "•" "Yellow" "[DRY-RUN] Would delete: $Path ($(Format-Size (Get-PathSizeBytes @($Path))))"
+                return
+            }
+            Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
             Write-Item "✓" "Green" "Removed: $Description"
         }
     }
@@ -213,7 +247,7 @@ function Clear-VisualStudio {
 
     # Project-level cleanup
     $solutionFiles = Get-ChildItem -Path $SearchDir -Filter "*.sln" -Recurse -ErrorAction SilentlyContinue
-    $projectFiles = Get-ChildItem -Path $SearchDir -Filter "*.csproj" -Recurse -ErrorAction SilentlyContinue
+    $projectFiles = Get-ChildItem -Path $SearchDir -Include "*.csproj", "*.fsproj", "*.vbproj" -File -Recurse -ErrorAction SilentlyContinue
 
     $cleanedCount = 0
 
@@ -221,7 +255,7 @@ function Clear-VisualStudio {
         $slnDir = $sln.DirectoryName
         Write-Host "  Cleaning solution: $slnDir" -ForegroundColor Cyan
 
-        Remove-SafelyWithTracking -Path "$slnDir\.vs" -Description ".vs folder in $slnDir"
+        Remove-SafelyWithTracking -Path (Join-Path $slnDir ".vs") -Description ".vs folder in $slnDir"
         $cleanedCount++
     }
 
@@ -229,8 +263,8 @@ function Clear-VisualStudio {
         $projDir = $proj.DirectoryName
         Write-Host "  Cleaning project: $projDir" -ForegroundColor Cyan
 
-        Remove-SafelyWithTracking -Path "$projDir\bin" -Description "bin folder in $projDir"
-        Remove-SafelyWithTracking -Path "$projDir\obj" -Description "obj folder in $projDir"
+        Remove-SafelyWithTracking -Path (Join-Path $projDir "bin") -Description "bin folder in $projDir"
+        Remove-SafelyWithTracking -Path (Join-Path $projDir "obj") -Description "obj folder in $projDir"
         $cleanedCount++
     }
 
@@ -787,6 +821,380 @@ function Clear-Docker {
     docker system prune @pruneArgs
 }
 
+# --- Project roots, node_modules, Playwright ---
+
+# Resolve the directories to scan into $script:ProjectRoots. Explicit dirs win
+# over DEV_CLEANER_PROJECT_DIRS (split on ';' on Windows), which wins over the
+# current directory. Missing dirs are dropped with a warning; a root nested in
+# another root is dropped so nothing is scanned twice.
+function Resolve-ProjectRoots {
+    param([string[]]$Dirs)
+
+    if ($Dirs) {
+        $candidates = $Dirs
+        $script:ProjectsDirSource = "command-line"
+    } elseif ($env:DEV_CLEANER_PROJECT_DIRS) {
+        $candidates = $env:DEV_CLEANER_PROJECT_DIRS -split [regex]::Escape([IO.Path]::PathSeparator)
+        $script:ProjectsDirSource = "environment"
+    } else {
+        $candidates = @(".")
+        $script:ProjectsDirSource = "default"
+    }
+
+    $valid = [System.Collections.Generic.List[string]]::new()
+    foreach ($c in $candidates) {
+        if (-not $c) { continue }
+        $c = $c -replace '^~', $HOME
+        if (Test-Path -LiteralPath $c -PathType Container) {
+            $full = (Resolve-Path -LiteralPath $c).ProviderPath.TrimEnd('\', '/')
+            if (-not $valid.Contains($full)) { $valid.Add($full) }
+        } else {
+            Write-Warning "Project directory not found, ignoring: $c"
+        }
+    }
+
+    $sep = [IO.Path]::DirectorySeparatorChar
+    $script:ProjectRoots = @($valid | Where-Object {
+        $root = $_
+        -not ($valid | Where-Object { $root.StartsWith($_ + $sep, [StringComparison]::OrdinalIgnoreCase) })
+    })
+}
+
+# Every directory under the roots (roots included), never entering hidden
+# folders, Library, *.app, AppData or links: they hold global installs and
+# editor extensions, not projects. node_modules is returned but not entered.
+function Get-ProjectTreeDirs {
+    param([string[]]$Roots)
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    foreach ($r in $Roots) {
+        $r
+        $stack.Push($r)
+    }
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        foreach ($child in @(Get-ChildItem -LiteralPath $dir -Directory -Force -ErrorAction SilentlyContinue)) {
+            $n = $child.Name
+            if ($n.StartsWith('.') -or $n -eq 'Library' -or $n -eq 'AppData' -or $n -like '*.app') { continue }
+            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $child.FullName
+            if ($n -ne 'node_modules') { $stack.Push($child.FullName) }
+        }
+    }
+}
+
+# Top-level node_modules that sit next to a package.json.
+function Get-NodeModulesDirs {
+    param([string[]]$Roots)
+    Get-ProjectTreeDirs -Roots $Roots | Where-Object {
+        (Split-Path -Leaf $_) -eq 'node_modules' -and
+        (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $_) 'package.json'))
+    }
+}
+
+function Clear-NodeModules {
+    param([string[]]$Roots = $script:ProjectRoots)
+
+    if (-not $Roots) {
+        Write-Item "✕" "Yellow" "No project directories to scan. Skipping."
+        return
+    }
+    Write-Item "✓" "Green" "Removing node_modules under: $($Roots -join ', ')"
+    $dirs = @(Get-NodeModulesDirs -Roots $Roots)
+    if ($dirs.Count -eq 0) {
+        Write-Item "ℹ️" "Yellow" "No node_modules found."
+        return
+    }
+    foreach ($d in $dirs) {
+        Remove-SafelyWithTracking -Path $d -Description "node_modules in $(Split-Path -Parent $d)"
+    }
+}
+
+# Playwright's downloaded browsers; `npx playwright install` re-downloads them.
+# PLAYWRIGHT_BROWSERS_PATH=0 keeps them inside node_modules (covered there).
+function Get-PlaywrightCacheDir {
+    if ($env:PLAYWRIGHT_BROWSERS_PATH) {
+        if ($env:PLAYWRIGHT_BROWSERS_PATH -ne '0') { return $env:PLAYWRIGHT_BROWSERS_PATH }
+        return $null
+    }
+    if (-not $env:LOCALAPPDATA) { return $null }
+    return (Join-Path $env:LOCALAPPDATA 'ms-playwright')
+}
+
+function Clear-Playwright {
+    $dir = Get-PlaywrightCacheDir
+    if ($dir -and (Test-Path -LiteralPath $dir)) {
+        Write-Item "✓" "Green" "Cleaning Playwright browsers..."
+        # Wipe contents, keep the dir playwright expects
+        foreach ($i in @(Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue)) {
+            Remove-SafelyWithTracking -Path $i.FullName -Description "Playwright: $($i.Name)"
+        }
+    } else {
+        Write-Item "✕" "Yellow" "Playwright browsers not found. Skipping."
+    }
+}
+
+# --- Git worktrees with finished PRs ---
+
+function Confirm-Action {
+    param([string]$Prompt)
+    $answer = Read-Host "$Prompt (y/N)"
+    return ($answer -eq 'y' -or $answer -eq 'Y')
+}
+
+function Test-GhReady {
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) { return $false }
+    gh auth status *> $null
+    return ($LASTEXITCODE -eq 0)
+}
+
+# "owner/repo" for a GitHub remote URL, $null for any other host.
+function ConvertTo-GitHubSlug {
+    param([string]$Url)
+    if ($Url -match '^(?:git@github\.com:|ssh://git@github\.com/|https://(?:[^@/]+@)?github\.com/)(.+?)(?:\.git)?/?$') {
+        return $Matches[1]
+    }
+    return $null
+}
+
+# MERGED, CLOSED, OPEN, NONE (no PR) or UNKNOWN (gh failed, e.g. offline).
+function Get-PrState {
+    param([string]$Slug, [string]$Branch)
+    $state = gh pr list --repo $Slug --head $Branch --state all --limit 1 --json state --jq '.[0].state // "NONE"' 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $state) { return 'UNKNOWN' }
+    return "$state".Trim()
+}
+
+function Get-WorktreeAction {
+    param([string]$State, [bool]$Dirty)
+    if ($Dirty) { return 'skip-dirty' }
+    switch ($State) {
+        'MERGED' { return 'remove' }
+        'CLOSED' { return 'warn' }
+        default  { return 'skip' }
+    }
+}
+
+# Linked worktrees of every git repo under the roots (worktrees outside the
+# roots included). The main worktree, detached HEADs, locked worktrees and
+# prunable ones (directory already gone) are skipped.
+function Get-Worktrees {
+    param([string[]]$Roots)
+    foreach ($repo in Get-ProjectTreeDirs -Roots $Roots) {
+        if (-not (Test-Path -LiteralPath (Join-Path $repo '.git') -PathType Container)) { continue }
+        $first = $true; $wt = $null; $branch = $null; $skip = $false
+        # Records end with a blank line; the extra '' flushes the last one.
+        foreach ($line in @(git -C $repo worktree list --porcelain 2>$null) + '') {
+            if ($line.StartsWith('worktree ')) { $wt = $line.Substring(9) }
+            elseif ($line.StartsWith('branch refs/heads/')) { $branch = $line.Substring(18) }
+            elseif ($line -match '^(detached|locked|prunable)') { $skip = $true }
+            elseif ($line -eq '') {
+                if (-not $first -and -not $skip -and $wt -and $branch) {
+                    [PSCustomObject]@{ Main = $repo; Path = $wt; Branch = $branch }
+                }
+                if ($wt) { $first = $false }
+                $wt = $null; $branch = $null; $skip = $false
+            }
+        }
+    }
+}
+
+# One row per worktree with its PR state and the action to take. Read-only.
+function Get-WorktreeRows {
+    param([string[]]$Roots)
+    foreach ($w in Get-Worktrees -Roots $Roots) {
+        $slug = ConvertTo-GitHubSlug (git -C $w.Main remote get-url origin 2>$null)
+        $state = if ($slug) { Get-PrState $slug $w.Branch } else { 'UNKNOWN' }
+        $dirty = [bool](git -C $w.Path status --porcelain 2>$null)
+        [PSCustomObject]@{
+            Action = Get-WorktreeAction $state $dirty
+            State  = $state
+            Slug   = $(if ($slug) { $slug } else { '-' })
+            Main   = $w.Main
+            Path   = $w.Path
+            Branch = $w.Branch
+        }
+    }
+}
+
+# Remove one worktree and its local branch. A refused removal is only forced
+# after a second, explicit yes; -Yes never forces. The branch is deleted with
+# -d, so git keeps it if it is not merged locally (e.g. squash-merged PRs).
+function Remove-Worktree {
+    param($Row)
+    git -C $Row.Main worktree remove $Row.Path 2>&1 | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        if ($script:AssumeYes) {
+            Write-Item "✕" "Red" "Could not remove $($Row.Path) (not forced: -Yes never forces)."
+            return $false
+        }
+        if (-not (Confirm-Action "Force removal of $($Row.Path)? Anything git still has there is lost.")) { return $false }
+        git -C $Row.Main worktree remove --force $Row.Path 2>&1 | Out-Host
+        if ($LASTEXITCODE -ne 0) { return $false }
+    }
+    Write-Item "✓" "Green" "Removed worktree: $($Row.Path)"
+
+    git -C $Row.Main branch -d $Row.Branch *> $null
+    if ($LASTEXITCODE -eq 0) {
+        Write-Item "✓" "Green" "Deleted branch: $($Row.Branch)"
+    } else {
+        Write-Item "ℹ️" "Yellow" "Kept branch $($Row.Branch): not merged locally (squash merge?). Delete it with: git -C `"$($Row.Main)`" branch -D `"$($Row.Branch)`""
+    }
+
+    # Tidy a now-empty parent folder (e.g. worksets\<ticket>\); project roots stay.
+    $parent = Split-Path -Parent $Row.Path
+    if ($script:ProjectRoots -notcontains $parent -and (Test-Path -LiteralPath $parent) -and
+        -not (Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+    }
+    return $true
+}
+
+# Offer to remove worktrees whose GitHub PR is merged (or closed, with a
+# warning). Open, PR-less, non-GitHub and dirty worktrees are never offered.
+function Clear-Worktrees {
+    if (-not (Test-GhReady)) {
+        Write-Item "✕" "Yellow" "GitHub CLI (gh) not found or not authenticated (run: gh auth login). Skipping."
+        return
+    }
+    if (-not $script:ProjectRoots) {
+        Write-Item "✕" "Yellow" "No project directories to scan. Skipping."
+        return
+    }
+
+    Write-Item "✓" "Green" "Checking worktrees under: $($script:ProjectRoots -join ', ')"
+    $rows = @(Get-WorktreeRows -Roots $script:ProjectRoots)
+    if ($rows.Count -eq 0) {
+        Write-Item "ℹ️" "Yellow" "No linked worktrees found."
+        return
+    }
+
+    Write-Host ("  {0,-11} {1,-8} {2,-28} {3}" -f "ACTION", "PR", "REPO", "BRANCH → WORKTREE")
+    foreach ($r in $rows) {
+        Write-Host ("  {0,-11} {1,-8} {2,-28} {3} → {4}" -f $r.Action, $r.State, $r.Slug, $r.Branch, $r.Path)
+    }
+    Write-Host ""
+
+    $removed = 0; $skipped = 0; $failed = 0
+    foreach ($r in $rows) {
+        if ($r.Action -eq 'remove') {
+            $prompt = "Remove worktree $($r.Path) (branch $($r.Branch), PR merged)?"
+        } elseif ($r.Action -eq 'warn') {
+            $prompt = "The PR for $($r.Branch) was CLOSED without merging. Remove worktree $($r.Path) anyway?"
+        } else {
+            $skipped++
+            continue
+        }
+
+        if ($script:DryRun) {
+            Write-Item "•" "Yellow" "[DRY-RUN] Would remove worktree: $($r.Path) and branch $($r.Branch)"
+            $removed++
+            continue
+        }
+        # -Yes only covers merged PRs; a closed one always needs an explicit yes.
+        $auto = ($r.Action -eq 'remove' -and $script:AssumeYes)
+        if (-not $auto -and -not (Confirm-Action $prompt)) {
+            $skipped++
+            continue
+        }
+        if (Remove-Worktree $r) { $removed++ } else { $failed++ }
+    }
+
+    if ($script:DryRun) {
+        Write-Item "✓" "Green" "Worktrees: $removed would be removed, $skipped skipped"
+    } else {
+        Write-Item "✓" "Green" "Worktrees: $removed removed, $skipped skipped, $failed failed"
+    }
+}
+
+# --- Dispatch by stable key ---
+# Same keys as the estimates, so -Only survives menu renumbering. ClearAllKeys
+# is also the Clear All order; worktrees is never part of it.
+$script:ClearAllKeys = @('visualstudio', 'android', 'androidsdk', 'flutter', 'npm', 'nuget', 'node_modules',
+    'platformio', 'cordova', 'electron', 'playwright', 'claudecode', 'docker', 'ide', 'windowstemp',
+    'browser', 'appcontainers')
+$script:CleanupKeys = $script:ClearAllKeys + 'worktrees'
+# Cleanups whose every deletion goes through Remove-SafelyWithTracking or
+# checks $script:DryRun; the others call tools that delete for real.
+$script:DryRunKeys = @('visualstudio', 'node_modules', 'playwright', 'worktrees')
+
+function Invoke-Cleanup {
+    param([string]$Key)
+    switch ($Key) {
+        "visualstudio" { Clear-VisualStudio -SearchDir $script:VsSearchDir }
+        "android" { Clear-AndroidGradle }
+        "androidsdk" { Clear-AndroidSdk }
+        "flutter" { Clear-Flutter -SearchDir $script:FlutterSearchDir }
+        "npm" { Clear-NpmYarnPnpm }
+        "nuget" { Clear-NuGet }
+        "node_modules" { Clear-NodeModules }
+        "platformio" { Clear-PlatformIO }
+        "cordova" { Clear-Cordova }
+        "electron" { Clear-Electron }
+        "playwright" { Clear-Playwright }
+        "claudecode" { Clear-ClaudeCode }
+        "docker" { Clear-Docker }
+        "ide" { Clear-IdeCaches }
+        "windowstemp" { Clear-WindowsTemp }
+        "browser" { Clear-BrowserCaches }
+        "appcontainers" { Clear-AppContainers }
+        "worktrees" { Clear-Worktrees }
+    }
+}
+
+# Option 1. node_modules only runs when project roots were set explicitly, so a
+# bulk run started from the user folder cannot wipe every project's packages.
+function Invoke-ClearAll {
+    foreach ($key in $script:ClearAllKeys) {
+        if ($key -eq 'node_modules' -and $script:ProjectsDirSource -eq 'default') {
+            Write-Item "✕" "Yellow" "Skipping node_modules: no project directories set (use -ProjectsDir or DEV_CLEANER_PROJECT_DIRS)."
+            continue
+        }
+        Invoke-Cleanup $key
+    }
+}
+
+# -Only <key,...>: run the selected cleanups without the menu. Sets
+# $script:OnlyExitCode (0 ok, 1 refused, 2 unknown key).
+function Invoke-Only {
+    param([string]$Keys)
+    $script:OnlyExitCode = 0
+    $list = @($Keys -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    foreach ($k in $list) {
+        if ($script:CleanupKeys -notcontains $k) {
+            Write-Host "Error: Unknown cleanup: $k" -ForegroundColor Red
+            Write-Host "Valid cleanups: $($script:CleanupKeys -join ', ')"
+            $script:OnlyExitCode = 2
+            return
+        }
+    }
+
+    if ($script:DryRun) {
+        $unsupported = @($list | Where-Object { $script:DryRunKeys -notcontains $_ })
+        if ($unsupported) {
+            Write-Host "-DryRun is only supported for: $($script:DryRunKeys -join ', ') (not: $($unsupported -join ', '))" -ForegroundColor Red
+            $script:OnlyExitCode = 1
+            return
+        }
+    } elseif (-not $script:AssumeYes) {
+        if ([Console]::IsInputRedirected) {
+            Write-Host "Refusing to delete without a terminal to confirm. Pass -Yes (or preview with -DryRun)." -ForegroundColor Red
+            $script:OnlyExitCode = 1
+            return
+        }
+        if (-not (Confirm-Action "Run $($list -join ', ')? Deleted files cannot be recovered.")) {
+            Write-Host "Cancelled."
+            return
+        }
+    }
+
+    if ($list -contains 'windowstemp') { Request-Elevation }
+    foreach ($k in $list) {
+        Write-SectionHeader "Cleaning: $k"
+        Invoke-Cleanup $k
+    }
+    Show-FailureSummary
+}
+
 # --- Reclaimable-space estimation ---
 # Read-only: computes the current on-disk size of what each cleanup option
 # would remove, then Show-Menu shows it next to each entry. Categories use
@@ -1025,6 +1433,28 @@ function Invoke-EstimateAll {
     $b = Get-PathSizeBytes $acPaths
     Set-Estimate "appcontainers" (Format-Size $b); $total += $b
 
+    Write-Host "  Measuring Playwright browsers..." -ForegroundColor DarkGray
+    $pw = Get-PlaywrightCacheDir
+    $b = if ($pw) { Get-PathSizeBytes @($pw) } else { [int64]0 }
+    Set-Estimate "playwright" (Format-Size $b); $total += $b
+
+    # Counted toward the Clear All total only when Clear All would clean it
+    # (explicit project roots, see Invoke-ClearAll).
+    Write-Host "  Measuring project node_modules..." -ForegroundColor DarkGray
+    $nm = @(Get-NodeModulesDirs -Roots $script:ProjectRoots)
+    $b = if ($nm) { Get-PathSizeBytes $nm } else { [int64]0 }
+    Set-Estimate "node_modules" (Format-Size $b)
+    if ($script:ProjectsDirSource -ne 'default') { $total += $b }
+
+    # Counted, not measured: deciding needs a gh call per worktree.
+    Write-Host "  Checking worktree PRs..." -ForegroundColor DarkGray
+    if (Test-GhReady) {
+        $n = @(Get-WorktreeRows -Roots $script:ProjectRoots | Where-Object { $_.Action -in 'remove', 'warn' }).Count
+        Set-Estimate "worktrees" "~$n candidate(s)"
+    } else {
+        Set-Estimate "worktrees" "n/a (gh not available)"
+    }
+
     Set-Estimate "total" ("~" + (Format-Size $total))
     $script:EstimatesReady = $true
     Write-Item "✓" "Green" "Estimates ready. ~ marks approximate values."
@@ -1063,10 +1493,14 @@ function Show-Menu {
     Write-Host ("14. Clean Windows Temp & Recycle Bin" + (Get-Est 'windowstemp')) -ForegroundColor Green
     Write-Host ("15. Clear Browser Caches (Chrome, Edge, Firefox, Brave, Opera)" + (Get-Est 'browser')) -ForegroundColor Green
     Write-Host ("16. Clean App Caches (Slack, Teams, Discord, Spotify, WhatsApp)" + (Get-Est 'appcontainers')) -ForegroundColor Green
+    Write-Host "─── Projects ───" -ForegroundColor DarkGray
+    Write-Host ("17. Clear project node_modules (under project directories)" + (Get-Est 'node_modules')) -ForegroundColor Green
+    Write-Host ("18. Clear Playwright browsers" + (Get-Est 'playwright')) -ForegroundColor Green
+    Write-Host ("19. Remove git worktrees with merged PRs (asks per worktree; needs gh)" + (Get-Est 'worktrees')) -ForegroundColor Green
     Write-Host ""
     Write-Host "99. Estimate reclaimable space (read-only, ~ = approximate)" -ForegroundColor Cyan
     Write-Host ""
-    Write-Host "→ Please enter your choice (0-16, or 99 to estimate): " -NoNewline
+    Write-Host "→ Please enter your choice (0-19, or 99 to estimate): " -NoNewline
 }
 
 # --- Main Loop ---
@@ -1086,21 +1520,7 @@ function Start-MainLoop {
             }
             "1" {
                 Write-SectionHeader "Performing ALL Cleanup Tasks"
-                Clear-VisualStudio -SearchDir $script:VsSearchDir
-                Clear-AndroidGradle
-                Clear-AndroidSdk
-                Clear-Flutter -SearchDir $script:FlutterSearchDir
-                Clear-NpmYarnPnpm
-                Clear-NuGet
-                Clear-PlatformIO
-                Clear-Cordova
-                Clear-Electron
-                Clear-ClaudeCode
-                Clear-Docker
-                Clear-IdeCaches
-                Clear-WindowsTemp
-                Clear-BrowserCaches
-                Clear-AppContainers
+                Invoke-ClearAll
             }
             "2" {
                 Write-SectionHeader "Performing Visual Studio Cleanup"
@@ -1190,6 +1610,18 @@ function Start-MainLoop {
                 Write-SectionHeader "Performing App Caches Cleanup"
                 Clear-AppContainers
             }
+            "17" {
+                Write-SectionHeader "Performing node_modules Cleanup"
+                Clear-NodeModules
+            }
+            "18" {
+                Write-SectionHeader "Performing Playwright Cleanup"
+                Clear-Playwright
+            }
+            "19" {
+                Write-SectionHeader "Performing Worktree Cleanup"
+                Clear-Worktrees
+            }
             "99" {
                 Write-SectionHeader "Estimating Reclaimable Space"
                 Invoke-EstimateAll
@@ -1198,7 +1630,7 @@ function Start-MainLoop {
                 continue
             }
             default {
-                Write-Host "Invalid choice. Please enter a number between 0 and 16." -ForegroundColor Red
+                Write-Host "Invalid choice. Please enter a number between 0 and 19." -ForegroundColor Red
                 Start-Sleep -Seconds 2
                 continue
             }
@@ -1217,6 +1649,9 @@ function Start-MainLoop {
     }
 }
 
+# Dot-sourced: define the functions above, run nothing.
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 # --- Entry Point ---
 
 # Handle -Help flag
@@ -1234,6 +1669,24 @@ Options:
                       Example: .\dev-cleaner.ps1 -FlutterDir "C:\Projects"
   -VsDir PATH         Set custom directory for Visual Studio cleanup (default: current directory)
                       Example: .\dev-cleaner.ps1 -VsDir "C:\Projects\DotNet"
+  -ProjectsDir PATHS  Directories to scan for node_modules and git worktrees
+                      (comma-separated; default: current directory)
+  -Only KEYS          Run only these cleanups (comma-separated), without the menu
+  -Yes                Don't ask: confirm -Only and remove worktrees whose PR is merged
+                      (closed PRs still ask; failed removals are never forced)
+  -DryRun             Show what would be deleted (with -Only; supported for:
+                      visualstudio, node_modules, playwright, worktrees)
+
+Cleanup keys for -Only:
+  $($script:CleanupKeys -join ', ')
+
+Project cleanups:
+  node_modules  node_modules next to a package.json
+  worktrees     git worktrees whose GitHub PR is merged (or closed, with a warning);
+                needs an authenticated gh. Never part of "Clear All", and worktrees
+                with uncommitted changes are never offered.
+  Scans skip hidden folders, AppData, Library and links. "Clear All" only cleans
+  node_modules when project directories were set explicitly.
 
 Interactive menu:
   Option 99 estimates the reclaimable space for every entry and redraws the
@@ -1246,10 +1699,13 @@ Examples:
   .\dev-cleaner.ps1 -FlutterDir "C:\Dev\Flutter"       # Custom Flutter search directory
   .\dev-cleaner.ps1 -VsDir "C:\Dev\DotNet"             # Custom VS search directory
   .\dev-cleaner.ps1 -FlutterDir "D:\Projects" -VsDir "D:\VS"  # Both custom directories
+  .\dev-cleaner.ps1 -Only node_modules,worktrees -ProjectsDir "C:\repos" -DryRun
+  .\dev-cleaner.ps1 -Only npm,nuget,playwright -Yes     # Unattended
 
 Environment Variables:
   `$env:FLUTTER_SEARCH_DIR = "C:\Projects\Flutter"
   `$env:VS_SEARCH_DIR = "C:\Projects\DotNet"
+  `$env:DEV_CLEANER_PROJECT_DIRS = "C:\repos;D:\work"
 
 Repository: $GITHUB_REPO
 "@
@@ -1308,6 +1764,24 @@ if ($script:VsSearchDir -ne "." -and -not (Test-Path $script:VsSearchDir)) {
     $script:VsDirSource = "default"
 }
 
+# Determine project directories (priority: CLI > ENV > Default)
+foreach ($d in $ProjectsDir) {
+    if (-not (Test-Path -LiteralPath $d -PathType Container)) {
+        Write-Host "Error: Project directory does not exist: $d" -ForegroundColor Red
+        exit 1
+    }
+}
+Resolve-ProjectRoots -Dirs $ProjectsDir
+
+if ($Only) {
+    Invoke-Only $Only
+    exit $script:OnlyExitCode
+}
+if ($DryRun) {
+    Write-Host "-DryRun needs -Only (supported: $($script:DryRunKeys -join ', '))." -ForegroundColor Red
+    exit 1
+}
+
 # Request elevation
 Request-Elevation
 
@@ -1340,6 +1814,14 @@ if ($script:VsSearchDir -ne ".") {
     Write-Host ""
 } else {
     Write-Host "Visual Studio search directory: current directory (default)" -ForegroundColor DarkGray
+    Write-Host ""
+}
+
+if ($script:ProjectsDirSource -ne "default") {
+    Write-Host "Project directories: $($script:ProjectRoots -join ', ')" -ForegroundColor Cyan
+    Write-Host ""
+} else {
+    Write-Host "Project directories: current directory (default)" -ForegroundColor DarkGray
     Write-Host ""
 }
 

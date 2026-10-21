@@ -28,9 +28,10 @@ else
 fi
 
 # --- Global Variables ---
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.3.0"
 GITHUB_REPO="https://github.com/jemishavasoya/dev-cleaner"
 DRY_RUN=false
+ASSUME_YES=false  # --yes: auto-confirm the safe choice (never forces anything)
 
 # Check if FLUTTER_SEARCH_DIR is already set as environment variable
 if [ -z "${FLUTTER_SEARCH_DIR}" ]; then
@@ -50,6 +51,13 @@ else
     fi
 fi
 
+# Project roots scanned for per-project build output (node_modules, .NET
+# bin/obj) and git worktrees. Set by resolve_project_roots() after argument
+# parsing: --projects-dir (repeatable) > DEV_CLEANER_PROJECT_DIRS > ".".
+CLI_PROJECT_DIRS=()
+PROJECT_ROOTS=()
+PROJECTS_DIR_SOURCE="default"
+
 # Logo
 print_logo() {
     echo -e "${CYAN}${BOLD}"
@@ -68,7 +76,8 @@ EOF
 # --- Helper Functions ---
 print_header_line() {
     local char="${1:-─}"
-    printf "%$(tput cols)s\n" "" | tr " " "$char"
+    # tput fails without a terminal (pipes, tests); fall back to 80 columns
+    printf "%${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}s\n" "" | tr " " "$char"
 }
 
 print_section_header() {
@@ -372,10 +381,21 @@ tracked_run() {
     return $status
 }
 
+# Paths no cleanup may ever delete, whatever a caller computed (an empty
+# variable turns "$DIR/" into "/", an unset one turns "$HOME/$X" into $HOME).
+is_protected_path() {
+    local p="$1"
+    while [[ "$p" == */ ]]; do p="${p%/}"; done
+    [[ -z "$p" || "$p" == "${HOME%/}" ]]
+}
+
 # Dry-run aware file/directory removal
+# Returns non-zero if any removal failed or was refused, so callers can count
+# failures; the remaining paths are still processed.
 # Usage: safe_rm [-r] <path> [<path> ...]
 safe_rm() {
     local recursive=""
+    local status=0
     local paths=()
     
     # Parse arguments
@@ -393,6 +413,11 @@ safe_rm() {
     done
     
     for path in "${paths[@]}"; do
+        if is_protected_path "$path"; then
+            print_item "✕" "${RED}" "Refusing to delete protected path: '${path}'"
+            status=1
+            continue
+        fi
         # Expand globs and handle paths
         local expanded_paths=()
         # Use nullglob to handle non-matching patterns
@@ -420,14 +445,16 @@ safe_rm() {
                     fi
                 else
                     if [[ -n "$recursive" ]]; then
-                        rm -rf "$expanded_path"
+                        rm -rf -- "$expanded_path" || status=1
                     else
-                        rm -f "$expanded_path"
+                        rm -f -- "$expanded_path" || status=1
                     fi
                 fi
             fi
         done
     done
+
+    return $status
 }
 
 # Dry-run aware sudo file/directory removal
@@ -454,6 +481,11 @@ safe_sudo_rm() {
     done
     
     for path in "${paths[@]}"; do
+        if is_protected_path "$path"; then
+            print_item "✕" "${RED}" "Refusing to delete protected path: '${path}'"
+            status=1
+            continue
+        fi
         # Expand globs and handle paths
         local expanded_paths=()
         shopt -s nullglob
@@ -478,9 +510,9 @@ safe_sudo_rm() {
                     fi
                 else
                     if [[ -n "$recursive" ]]; then
-                        sudo rm -rf "$expanded_path" || status=1
+                        sudo rm -rf -- "$expanded_path" || status=1
                     else
-                        sudo rm -f "$expanded_path" || status=1
+                        sudo rm -f -- "$expanded_path" || status=1
                     fi
                 fi
             fi
@@ -488,6 +520,347 @@ safe_sudo_rm() {
     done
 
     return $status
+}
+
+# --- Project roots ---
+
+# Resolve the directories to scan into PROJECT_ROOTS (absolute, physical).
+# Explicit dirs win over DEV_CLEANER_PROJECT_DIRS (colon-separated), which
+# wins over the current directory. Missing dirs are dropped with a warning;
+# a root nested inside another root is dropped so nothing is scanned (or
+# counted) twice, e.g. ~/repos + ~/repos/worksets -> ~/repos.
+# Usage: resolve_project_roots [<dir> ...]
+resolve_project_roots() {
+    local candidates=() valid=() dir root other keep
+    if [ $# -gt 0 ]; then
+        candidates=("$@")
+        PROJECTS_DIR_SOURCE="command-line"
+    elif [ -n "${DEV_CLEANER_PROJECT_DIRS:-}" ]; then
+        IFS=':' read -r -a candidates <<< "$DEV_CLEANER_PROJECT_DIRS"
+        PROJECTS_DIR_SOURCE="environment"
+    else
+        candidates=(".")
+        PROJECTS_DIR_SOURCE="default"
+    fi
+
+    for dir in "${candidates[@]}"; do
+        [ -n "$dir" ] || continue
+        dir="${dir/#\~/$HOME}"
+        if [ -d "$dir" ]; then
+            valid+=("$(cd "$dir" && pwd -P)")
+        else
+            print_item "⚠️" "${YELLOW}" "Project directory not found, ignoring: $dir" >&2
+        fi
+    done
+
+    PROJECT_ROOTS=()
+    for root in "${valid[@]}"; do
+        keep=true
+        for other in "${valid[@]}"; do
+            [[ "$root" == "$other"/* ]] && keep=false
+        done
+        for other in "${PROJECT_ROOTS[@]}"; do
+            [ "$root" = "$other" ] && keep=false
+        done
+        $keep && PROJECT_ROOTS+=("$root")
+    done
+    return 0
+}
+
+# --- Per-project build output ---
+# Scans never descend into hidden dirs (.git, .nvm, .vscode/extensions…),
+# macOS Library, app bundles or Windows AppData: they hold global installs and
+# editor extensions whose package.json/node_modules are not projects.
+# -mindepth 1 keeps a hidden scan root itself (e.g. ~/.work) from being pruned.
+# ponytail: newline-separated output, paths containing newlines are not supported.
+
+# Echo each top-level node_modules dir that sits next to a package.json.
+# Usage: find_node_modules <root> [<root> ...]
+find_node_modules() {
+    local root dir
+    for root in "$@"; do
+        while IFS= read -r dir; do
+            [ -f "$(dirname "$dir")/package.json" ] && echo "$dir"
+        done < <(find "$root" -mindepth 1 \
+            \( -name '.*' -o -name Library -o -name '*.app' -o -name AppData \) -prune \
+            -o -type d -name node_modules -prune -print 2>/dev/null)
+    done
+    return 0
+}
+
+# Echo .NET build output: bin/ and obj/ next to a *.csproj/*.fsproj/*.vbproj,
+# and .vs/ next to a *.sln. Driven by project files, not folder names, so a
+# Node repo's bin/ scripts dir is never matched (same rule as dev-cleaner.ps1).
+# Usage: find_dotnet_artifacts <root> [<root> ...]
+find_dotnet_artifacts() {
+    local root file dir sub
+    for root in "$@"; do
+        while IFS= read -r file; do
+            dir="$(dirname "$file")"
+            case "$file" in
+                *.sln) [ -d "$dir/.vs" ] && echo "$dir/.vs" ;;
+                *)
+                    for sub in bin obj; do
+                        [ -d "$dir/$sub" ] && echo "$dir/$sub"
+                    done
+                    ;;
+            esac
+        done < <(find "$root" -mindepth 1 \
+            \( -name '.*' -o -name Library -o -name '*.app' -o -name AppData \
+               -o -name node_modules -o -name bin -o -name obj \) -prune \
+            -o -type f \( -name '*.csproj' -o -name '*.fsproj' -o -name '*.vbproj' -o -name '*.sln' \) -print 2>/dev/null)
+    done | sort -u
+}
+
+# Sum the size (KB) of everything a finder returns for PROJECT_ROOTS. Read-only.
+# Usage: project_paths_kb <finder>
+project_paths_kb() {
+    local paths=() path
+    [ ${#PROJECT_ROOTS[@]} -gt 0 ] || { echo 0; return 0; }
+    while IFS= read -r path; do
+        paths+=("$path")
+    done < <("$1" "${PROJECT_ROOTS[@]}")
+    [ ${#paths[@]} -gt 0 ] || { echo 0; return 0; }
+    du_kb_sum "${paths[@]}"
+}
+
+# Delete everything a finder returns for PROJECT_ROOTS and report counts.
+# A failed deletion is counted and the run continues.
+# Usage: cleanup_project_paths <label> <finder>
+cleanup_project_paths() {
+    local label="$1" finder="$2" path removed=0 failed=0
+    if [ ${#PROJECT_ROOTS[@]} -eq 0 ]; then
+        print_item "✕" "${YELLOW}" "No project directories to scan. Skipping."
+        return 0
+    fi
+    print_item "✓" "${GREEN}" "Removing ${label} under: ${PROJECT_ROOTS[*]}"
+    while IFS= read -r path; do
+        if safe_rm -rf "$path"; then
+            removed=$((removed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done < <("$finder" "${PROJECT_ROOTS[@]}")
+
+    if [ $((removed + failed)) -eq 0 ]; then
+        print_item "ℹ️" "${YELLOW}" "No ${label} found."
+    elif $DRY_RUN; then
+        print_item "✓" "${GREEN}" "${label}: ${removed} would be removed"
+    elif [ $failed -gt 0 ]; then
+        print_item "⚠️" "${YELLOW}" "${label}: ${removed} removed, ${failed} failed"
+    else
+        print_item "✓" "${GREEN}" "${label}: ${removed} removed"
+    fi
+    return 0
+}
+
+cleanup_node_modules() {
+    cleanup_project_paths "node_modules" find_node_modules
+}
+
+cleanup_dotnet_artifacts() {
+    cleanup_project_paths ".NET build output (bin/obj/.vs)" find_dotnet_artifacts
+}
+
+# --- Git worktrees with finished PRs ---
+
+# Ask a y/N question. Enter, EOF or anything but y/Y is "no".
+confirm() {
+    local ans=""
+    echo -e "${YELLOW}$1 (y/N):${NC} \c"
+    read -r ans || true
+    echo ""
+    [[ "$ans" == "y" || "$ans" == "Y" ]]
+}
+
+# Echo "owner/repo" for a GitHub remote URL, nothing for any other host.
+github_slug() {
+    local url="$1" path
+    case "$url" in
+        git@github.com:*) path="${url#git@github.com:}" ;;
+        ssh://git@github.com/*) path="${url#ssh://git@github.com/}" ;;
+        https://github.com/*|https://*@github.com/*) path="${url#*github.com/}" ;;
+        *) return 0 ;;
+    esac
+    path="${path%/}"
+    echo "${path%.git}"
+}
+
+# Echo "<main repo>\t<worktree>\t<branch>" for every linked worktree of every
+# git repo under the given roots. Worktrees living outside the roots are
+# included (their repo is inside). The main worktree, detached HEADs, locked
+# worktrees and prunable ones (directory already gone) are skipped.
+list_worktrees() {
+    local root gitdir repo line wt branch skip first
+    for root in "$@"; do
+        while IFS= read -r gitdir; do
+            repo="$(dirname "$gitdir")"
+            first=true
+            wt="" branch="" skip=false
+            # Porcelain records end with a blank line; the extra echo makes sure
+            # the last one is flushed even if git ever stops printing it.
+            while IFS= read -r line; do
+                case "$line" in
+                    "worktree "*) wt="${line#worktree }" ;;
+                    "branch refs/heads/"*) branch="${line#branch refs/heads/}" ;;
+                    detached|locked|"locked "*|prunable|"prunable "*) skip=true ;;
+                    "")
+                        if ! $first && ! $skip && [ -n "$wt" ] && [ -n "$branch" ]; then
+                            printf '%s\t%s\t%s\n' "$repo" "$wt" "$branch"
+                        fi
+                        [ -n "$wt" ] && first=false
+                        wt="" branch="" skip=false
+                        ;;
+                esac
+            done < <(git -C "$repo" worktree list --porcelain 2>/dev/null; echo)
+        done < <(find "$root" -mindepth 1 \( -name .git -type d -print -prune \) -o \
+            \( -name '.*' -o -name node_modules -o -name Library -o -name '*.app' -o -name AppData \) -prune 2>/dev/null)
+    done
+    return 0
+}
+
+# Echo the state of the latest PR for a branch: MERGED, CLOSED, OPEN, NONE (no
+# PR) or UNKNOWN (gh failed, e.g. offline).
+pr_state() {
+    local state
+    state="$(gh pr list --repo "$1" --head "$2" --state all --limit 1 \
+        --json state --jq '.[0].state // "NONE"' 2>/dev/null)" || state=""
+    echo "${state:-UNKNOWN}"
+}
+
+# Usage: worktree_action <pr_state> <dirty:true|false>
+worktree_action() {
+    if [ "$2" = "true" ]; then
+        echo "skip-dirty"
+        return 0
+    fi
+    case "$1" in
+        MERGED) echo "remove" ;;
+        CLOSED) echo "warn" ;;
+        *) echo "skip" ;;
+    esac
+}
+
+# Echo "<action>\t<pr_state>\t<owner/repo or ->\t<main>\t<worktree>\t<branch>"
+# for every linked worktree under the given roots. Read-only (asks gh).
+collect_worktrees() {
+    local main wt branch slug state dirty
+    while IFS=$'\t' read -r main wt branch; do
+        slug="$(github_slug "$(git -C "$main" remote get-url origin 2>/dev/null)")"
+        state="UNKNOWN"
+        [ -n "$slug" ] && state="$(pr_state "$slug" "$branch")"
+        dirty=false
+        [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ] && dirty=true
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$(worktree_action "$state" "$dirty")" "$state" "${slug:--}" "$main" "$wt" "$branch"
+    done < <(list_worktrees "$@")
+}
+
+gh_ready() {
+    command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1
+}
+
+# Remove one worktree and its local branch. A refused removal is only forced
+# after a second, explicit yes; --yes never forces. The branch is deleted with
+# -d, so git keeps it if it is not merged locally (e.g. squash-merged PRs).
+# Usage: remove_worktree <main repo> <worktree> <branch>
+remove_worktree() {
+    local main="$1" wt="$2" branch="$3" kb parent root
+    kb=$(du_kb_sum "$wt")
+    if ! git -C "$main" worktree remove "$wt"; then
+        if $ASSUME_YES; then
+            print_item "✕" "${RED}" "Could not remove $wt (not forced: --yes never forces)."
+            return 1
+        fi
+        confirm "Force removal of $wt? Anything git still has there is lost." || return 1
+        git -C "$main" worktree remove --force "$wt" || return 1
+    fi
+    add_reclaimed_kb "$kb"
+    print_item "✓" "${GREEN}" "Removed worktree: $wt"
+
+    if git -C "$main" branch -d "$branch" >/dev/null 2>&1; then
+        print_item "✓" "${GREEN}" "Deleted branch: $branch"
+    else
+        print_item "ℹ️" "${YELLOW}" "Kept branch $branch: not merged locally (squash merge?). Delete it with: git -C \"$main\" branch -D \"$branch\""
+    fi
+
+    # Tidy a now-empty parent folder (e.g. worksets/<ticket>/). rmdir never
+    # deletes content, and project roots are left alone.
+    parent="$(dirname "$wt")"
+    for root in "${PROJECT_ROOTS[@]}"; do
+        [ "$parent" = "$root" ] && return 0
+    done
+    is_protected_path "$parent" || rmdir "$parent" 2>/dev/null || true
+    return 0
+}
+
+# Offer to remove git worktrees whose GitHub PR is merged (or closed, with a
+# warning). Open, PR-less, non-GitHub and dirty worktrees are never offered.
+cleanup_worktrees() {
+    if ! command -v gh >/dev/null 2>&1; then
+        print_item "✕" "${YELLOW}" "GitHub CLI (gh) not found. Skipping."
+        return 0
+    fi
+    if ! gh auth status >/dev/null 2>&1; then
+        print_item "✕" "${YELLOW}" "gh is not authenticated (run: gh auth login). Skipping."
+        return 0
+    fi
+    if [ ${#PROJECT_ROOTS[@]} -eq 0 ]; then
+        print_item "✕" "${YELLOW}" "No project directories to scan. Skipping."
+        return 0
+    fi
+
+    print_item "✓" "${GREEN}" "Checking worktrees under: ${PROJECT_ROOTS[*]}"
+    local rows=() row action state slug main wt branch kb prompt
+    while IFS= read -r row; do
+        rows+=("$row")
+    done < <(collect_worktrees "${PROJECT_ROOTS[@]}")
+    if [ ${#rows[@]} -eq 0 ]; then
+        print_item "ℹ️" "${YELLOW}" "No linked worktrees found."
+        return 0
+    fi
+
+    printf "  %-11s %-8s %-28s %s\n" "ACTION" "PR" "REPO" "BRANCH → WORKTREE"
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r action state slug main wt branch <<< "$row"
+        printf "  %-11s %-8s %-28s %s\n" "$action" "$state" "$slug" "$branch → $wt"
+    done
+    echo ""
+
+    local removed=0 skipped=0 failed=0
+    for row in "${rows[@]}"; do
+        IFS=$'\t' read -r action state slug main wt branch <<< "$row"
+        case "$action" in
+            remove) prompt="Remove worktree $wt (branch $branch, PR merged)?" ;;
+            warn) prompt="The PR for $branch was CLOSED without merging. Remove worktree $wt anyway?" ;;
+            *) skipped=$((skipped + 1)); continue ;;
+        esac
+
+        if $DRY_RUN; then
+            kb=$(du_kb_sum "$wt")
+            add_reclaimed_kb "$kb"
+            echo -e "${YELLOW}[DRY-RUN] Would remove worktree: $wt and branch $branch ($(human_kb "$kb"))${NC}"
+            removed=$((removed + 1))
+            continue
+        fi
+        # --yes only covers merged PRs; a closed one always needs an explicit yes.
+        if ! { [ "$action" = "remove" ] && $ASSUME_YES; } && ! confirm "$prompt"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        if remove_worktree "$main" "$wt" "$branch"; then
+            removed=$((removed + 1))
+        else
+            failed=$((failed + 1))
+        fi
+    done
+
+    if $DRY_RUN; then
+        print_item "✓" "${GREEN}" "Worktrees: ${removed} would be removed, ${skipped} skipped"
+    else
+        print_item "✓" "${GREEN}" "Worktrees: ${removed} removed, ${skipped} skipped, ${failed} failed"
+    fi
+    return 0
 }
 
 # --- Cleanup Functions ---
@@ -553,16 +926,14 @@ cleanup_android() {
 cleanup_android_sdk() {
     if [ -d "$HOME/Library/Android/sdk" ]; then
         print_item "✓" "${GREEN}" "Cleaning old Android SDK build-tools (keeping latest 2 versions)..."
-        # Keep only latest 2 versions of build-tools
-        if [ -d "$HOME/Library/Android/sdk/build-tools" ]; then
-            cd "$HOME/Library/Android/sdk/build-tools" 2>/dev/null || return
-            if $DRY_RUN; then
-                ls -t | tail -n +3 | while read -r dir; do
-                    echo -e "${YELLOW}[DRY-RUN] Would delete: $HOME/Library/Android/sdk/build-tools/$dir${NC}"
-                done
-            else
-                ls -t | tail -n +3 | xargs -I {} rm -rf {}
-            fi
+        # Keep only latest 2 versions of build-tools (newest first by mtime).
+        # safe_rm handles dry-run and credits the reclaimed space.
+        local build_tools="$HOME/Library/Android/sdk/build-tools" old
+        if [ -d "$build_tools" ]; then
+            # shellcheck disable=SC2012  # version dir names never contain newlines
+            while IFS= read -r old; do
+                [ -n "$old" ] && safe_rm -rf "$build_tools/$old"
+            done < <(ls -t "$build_tools" | tail -n +3)
         fi
 
         print_item "✓" "${GREEN}" "Cleaning old Android platform-tools..."
@@ -571,13 +942,10 @@ cleanup_android_sdk() {
         # For Apple Silicon Macs, remove x86 emulator images if they exist
         if [ "$(uname -m)" = "arm64" ]; then
             print_item "✓" "${GREEN}" "Removing x86 emulator images (ARM Mac detected)..."
-            if $DRY_RUN; then
-                find ~/Library/Android/sdk/system-images -type d -name "x86" 2>/dev/null | while read -r dir; do
-                    echo -e "${YELLOW}[DRY-RUN] Would delete: $dir${NC}"
-                done
-            else
-                find ~/Library/Android/sdk/system-images -type d -name "x86" -exec rm -rf {} + 2>/dev/null || true
-            fi
+            local img
+            while IFS= read -r -d '' img; do
+                safe_rm -rf "$img"
+            done < <(find "$HOME/Library/Android/sdk/system-images" -type d -name "x86" -prune -print0 2>/dev/null)
         fi
     else
         print_item "✕" "${YELLOW}" "Android SDK not found. Skipping."
@@ -682,15 +1050,16 @@ cleanup_platformIO() {
 
     print_item "✓" "${GREEN}" "Cleaning PlatformIO project builds (pio run clean)..."
 
-    # Find pubspec.yaml and run 'pio run -t clean' in each directory
-    # -print0 handles spaces/newlines safely
-    find ~/ -maxdepth 4 -type d -name "Library" -prune -o -name "platformio.ini" -print0 | while IFS= read -r -d '' file; do
+    # Find platformio.ini and run 'pio run -t clean' for each project.
+    # -print0 handles spaces/newlines safely; process substitution (not a
+    # pipe) keeps tracked_run's reclaimed-space credit in this shell.
+    # -d targets the project without cd'ing, and tracked_run honours --dry-run.
+    local file dir
+    while IFS= read -r -d '' file; do
         dir="$(dirname "$file")"
         printf 'Running: %s run clean in %s\n' "$PIO_BIN" "$dir"
-
-        # Run in a subshell to avoid changing caller's CWD
-        ( cd "$dir" && "$PIO_BIN" run -t clean )
-    done
+        tracked_run "$dir/.pio/build" -- "$PIO_BIN" run -t clean -d "$dir"
+    done < <(find "$HOME/" -maxdepth 4 -type d -name "Library" -prune -o -name "platformio.ini" -print0)
 }
 
 cleanup_npm_yarn() {
@@ -944,6 +1313,33 @@ cleanup_electron() {
     fi
 }
 
+# Playwright's downloaded browsers (Chromium, Firefox, WebKit; hundreds of MB
+# per version). `npx playwright install` re-downloads them. Echoes nothing when
+# PLAYWRIGHT_BROWSERS_PATH=0, which keeps browsers inside node_modules (the
+# node_modules target covers those).
+playwright_cache_dir() {
+    if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
+        [ "$PLAYWRIGHT_BROWSERS_PATH" = "0" ] || echo "${PLAYWRIGHT_BROWSERS_PATH/#\~/$HOME}"
+        return 0
+    fi
+    case "$(uname)" in
+        Darwin) echo "$HOME/Library/Caches/ms-playwright" ;;
+        *) echo "${XDG_CACHE_HOME:-$HOME/.cache}/ms-playwright" ;;
+    esac
+}
+
+cleanup_playwright() {
+    local dir
+    dir="$(playwright_cache_dir)"
+    if [ -n "$dir" ] && [ -d "$dir" ]; then
+        print_item "✓" "${GREEN}" "Cleaning Playwright browsers..."
+        # Wipe contents, keep the dir playwright expects
+        safe_rm -rf "$dir"/*
+    else
+        print_item "✕" "${YELLOW}" "Playwright browsers not found. Skipping."
+    fi
+}
+
 # Prunes ~/.local/share/claude/versions, keeping the version the `claude`
 # launcher points at (plus any binary a running session still has open).
 # Never touches ~/.claude/ or ~/.claude.json: settings, MCP config and
@@ -1038,6 +1434,96 @@ cleanup_docker() {
             fi
         fi
     fi
+}
+
+# --- Dispatch by stable key ---
+# The same keys as the estimates, so --only keeps working when the menu is
+# renumbered. CLEAR_ALL_KEYS is also the Clear All order; worktrees is never
+# part of it (it asks gh and wants per-item consent).
+CLEAR_ALL_KEYS="xcode android android_sdk flutter platformio npm nuget node_modules dotnet homebrew cocoapods ide system browser cordova electron playwright claude docker appcontainers timemachine"
+CLEANUP_KEYS="$CLEAR_ALL_KEYS worktrees"
+
+# Usage: run_cleanup <key>   (returns 2 for an unknown key)
+run_cleanup() {
+    case "$1" in
+        xcode) cleanup_xcode ;;
+        android) cleanup_android ;;
+        android_sdk) cleanup_android_sdk ;;
+        flutter) cleanup_flutter "$FLUTTER_SEARCH_DIR" ;;
+        platformio) cleanup_platformIO ;;
+        npm) cleanup_npm_yarn ;;
+        nuget) cleanup_nuget ;;
+        node_modules) cleanup_node_modules ;;
+        dotnet) cleanup_dotnet_artifacts ;;
+        homebrew) cleanup_homebrew ;;
+        cocoapods) cleanup_cocoapods ;;
+        ide) cleanup_ide_caches ;;
+        system) cleanup_system_junk ;;
+        browser) cleanup_browser_caches ;;
+        cordova) cleanup_cordova ;;
+        electron) cleanup_electron ;;
+        playwright) cleanup_playwright ;;
+        claude) cleanup_claude_code ;;
+        docker) cleanup_docker ;;
+        appcontainers) cleanup_app_containers ;;
+        timemachine) cleanup_timemachine_snapshots ;;
+        worktrees) cleanup_worktrees ;;
+        *) return 2 ;;
+    esac
+}
+
+# Option 1. Per-project build output only runs when the project roots were
+# set explicitly: a bulk run started from ~ must not recursively wipe every
+# node_modules and bin/obj under the home folder.
+clear_all() {
+    local key
+    for key in $CLEAR_ALL_KEYS; do
+        if [[ "$key" == "node_modules" || "$key" == "dotnet" ]] && [ "$PROJECTS_DIR_SOURCE" = "default" ]; then
+            print_item "✕" "${YELLOW}" "Skipping ${key}: no project directories set (use --projects-dir or DEV_CLEANER_PROJECT_DIRS)."
+            continue
+        fi
+        run_cleanup "$key"
+    done
+}
+
+# --only <key,...>: run the selected cleanups without the menu and exit.
+# Deleting without a terminal needs --yes; --dry-run never does.
+run_only() {
+    local keys=() key needs_sudo=false
+    IFS=',' read -r -a keys <<< "$1"
+    for key in "${keys[@]}"; do
+        if [[ " $CLEANUP_KEYS " != *" $key "* ]]; then
+            echo -e "${RED}Error: Unknown cleanup: ${key}${NC}"
+            echo "Valid cleanups: ${CLEANUP_KEYS// /, }"
+            return 2
+        fi
+        [[ "$key" == "system" || "$key" == "timemachine" ]] && needs_sudo=true
+    done
+
+    if ! $DRY_RUN && ! $ASSUME_YES; then
+        if [ ! -t 0 ]; then
+            echo -e "${RED}Refusing to delete without a terminal to confirm. Pass --yes (or preview with --dry-run).${NC}"
+            return 1
+        fi
+        confirm "Run ${keys[*]}? Deleted files cannot be recovered." || { echo "Cancelled."; return 0; }
+    fi
+    if $needs_sudo; then
+        sudo -v || return 1
+    fi
+
+    RECLAIMED_KB=0
+    HOST_INVISIBLE_KB=0
+    for key in "${keys[@]}"; do
+        print_section_header "Cleaning: ${key}"
+        run_cleanup "$key"
+    done
+    echo ""
+    if $DRY_RUN; then
+        echo -e "${CYAN}Would reclaim: ~$(human_kb "$RECLAIMED_KB")${NC}"
+    else
+        echo -e "${BLUE}Reclaimed: ~$(human_kb "$RECLAIMED_KB")${NC}"
+    fi
+    return 0
 }
 
 # --- Reclaimable-space estimation ---
@@ -1312,6 +1798,38 @@ estimate_all() {
     set_estimate appcontainers "$(human_kb "$kb")"
     total=$((total + kb))
 
+    print_item "•" "${FAINT}" "Measuring Playwright browsers..."
+    local pw_dir
+    pw_dir="$(playwright_cache_dir)"
+    kb=0
+    [ -n "$pw_dir" ] && kb=$(du_kb_sum "$pw_dir"/*)
+    set_estimate playwright "$(human_kb "$kb")"
+    total=$((total + kb))
+
+    # Per-project build output counts toward the Clear All total only when
+    # Clear All would clean it (explicit project roots, see clear_all()).
+    print_item "•" "${FAINT}" "Measuring project node_modules..."
+    kb=$(project_paths_kb find_node_modules)
+    set_estimate node_modules "$(human_kb "$kb")"
+    [ "$PROJECTS_DIR_SOURCE" != "default" ] && total=$((total + kb))
+
+    print_item "•" "${FAINT}" "Measuring .NET build output..."
+    kb=$(project_paths_kb find_dotnet_artifacts)
+    set_estimate dotnet "$(human_kb "$kb")"
+    [ "$PROJECTS_DIR_SOURCE" != "default" ] && total=$((total + kb))
+
+    # Counted, not measured: deciding needs a gh call per worktree. Never part
+    # of Clear All, so never added to the total.
+    print_item "•" "${FAINT}" "Checking worktree PRs..."
+    if gh_ready; then
+        local wt_count=0
+        [ ${#PROJECT_ROOTS[@]} -gt 0 ] && \
+            wt_count=$(collect_worktrees "${PROJECT_ROOTS[@]}" | grep -cE '^(remove|warn)'$'\t')
+        set_estimate worktrees "~${wt_count:-0} candidate(s)"
+    else
+        set_estimate worktrees "n/a (gh not available)"
+    fi
+
     print_item "•" "${FAINT}" "Counting Time Machine local snapshots..."
     local tm_count
     tm_count=$(sudo tmutil listlocalsnapshots / 2>/dev/null | grep -c 'com.apple.TimeMachine')
@@ -1354,10 +1872,14 @@ display_menu() {
     echo -e "${GREEN}17.${NC} Remove Time Machine Local Snapshots (requires sudo)$(est timemachine)"
     echo -e "${GREEN}18.${NC} Clear .NET NuGet Caches (global-packages, http-cache, temp, plugins)$(est nuget)"
     echo -e "${GREEN}19.${NC} Clear old Claude Code versions ${FAINT}(keeps the version in use)${NC}$(est claude)"
+    echo -e "${GREEN}20.${NC} Clear project node_modules ${FAINT}(under project directories)${NC}$(est node_modules)"
+    echo -e "${GREEN}21.${NC} Clear .NET build output ${FAINT}(bin/obj next to projects, .vs next to solutions)${NC}$(est dotnet)"
+    echo -e "${GREEN}22.${NC} Clear Playwright browsers$(est playwright)"
+    echo -e "${GREEN}23.${NC} Remove git worktrees with merged PRs ${FAINT}(asks per worktree; needs gh)${NC}$(est worktrees)"
     echo ""
     echo -e "${CYAN}99.${NC} Estimate reclaimable space ${FAINT}(read-only, ~ = approximate)${NC}"
     echo ""
-    echo -e "→ Please enter your choice (0-19, or 99 to estimate): ${NC}\c"
+    echo -e "→ Please enter your choice (0-23, or 99 to estimate): ${NC}\c"
 }
 
 # --- Help function ---
@@ -1374,6 +1896,24 @@ Options:
   --dry-run               Show what would be deleted without actually removing files
   --flutter-dir PATH      Set custom directory for Flutter cleanup (default: current directory)
                           Example: $0 --flutter-dir ~/Projects
+  --projects-dir PATH     Directory to scan for node_modules, .NET build output and git
+                          worktrees (repeatable; default: current directory).
+                          Env: DEV_CLEANER_PROJECT_DIRS="~/repos:~/work"
+  --only KEY[,KEY...]     Run only these cleanups, without the menu, then exit
+  --yes                   Don't ask: confirm --only and remove worktrees whose PR is
+                          merged (closed PRs still ask; failed removals are never forced)
+
+Cleanup keys for --only:
+  ${CLEANUP_KEYS}
+
+Project cleanups:
+  node_modules  node_modules next to a package.json
+  dotnet        bin/ and obj/ next to *.csproj/*.fsproj/*.vbproj, .vs/ next to *.sln
+  worktrees     git worktrees whose GitHub PR is merged (or closed, with a warning);
+                needs an authenticated gh. Never part of "Clear All", and worktrees
+                with uncommitted changes are never offered.
+  Scans skip hidden folders, Library, *.app and AppData. "Clear All" only cleans
+  node_modules and dotnet when project directories were set explicitly.
 
 Command-line Flutter cleanup:
   You can specify a custom directory for Flutter cleanup using the --flutter-dir option.
@@ -1397,6 +1937,9 @@ Examples:
   $0 --dry-run                          # Preview what would be deleted without removing anything
   $0 --flutter-dir ~/Development        # Run with custom Flutter search directory
   $0 --flutter-dir ~/Projects/Flutter   # Search only in specific Flutter projects folder
+  $0 --projects-dir ~/repos             # Scan ~/repos for node_modules, bin/obj and worktrees
+  $0 --only node_modules,dotnet --projects-dir ~/repos --dry-run
+  $0 --only npm,nuget,playwright --yes  # Unattended (e.g. from cron)
 
 Repository: ${GITHUB_REPO}
 EOF
@@ -1429,24 +1972,7 @@ main_loop() {
                 ;;
             1)
                 print_section_header "Performing ALL Cleanup Tasks"
-                cleanup_xcode
-                cleanup_android
-                cleanup_android_sdk
-                cleanup_flutter "$FLUTTER_SEARCH_DIR"
-                cleanup_platformIO
-                cleanup_npm_yarn
-                cleanup_nuget
-                cleanup_homebrew
-                cleanup_cocoapods
-                cleanup_ide_caches
-                cleanup_system_junk
-                cleanup_browser_caches
-                cleanup_cordova
-                cleanup_electron
-                cleanup_claude_code
-                cleanup_docker
-                cleanup_app_containers
-                cleanup_timemachine_snapshots
+                clear_all
                 ;;
             2)
                 print_section_header "Performing Xcode Cleanup"
@@ -1561,6 +2087,22 @@ main_loop() {
                 print_section_header "Performing Claude Code Version Cleanup"
                 cleanup_claude_code
                 ;;
+            20)
+                print_section_header "Performing node_modules Cleanup"
+                cleanup_node_modules
+                ;;
+            21)
+                print_section_header "Performing .NET Build Output Cleanup"
+                cleanup_dotnet_artifacts
+                ;;
+            22)
+                print_section_header "Performing Playwright Cleanup"
+                cleanup_playwright
+                ;;
+            23)
+                print_section_header "Performing Worktree Cleanup"
+                cleanup_worktrees
+                ;;
             99)
                 print_section_header "Estimating Reclaimable Space"
                 estimate_all
@@ -1569,7 +2111,7 @@ main_loop() {
                 continue
                 ;;
             *)
-                echo -e "${RED}Invalid choice. Please enter a number between 0 and 19.${NC}"
+                echo -e "${RED}Invalid choice. Please enter a number between 0 and 23.${NC}"
                 sleep 2
                 ;;
         esac
@@ -1598,6 +2140,9 @@ main_loop() {
     echo -e "${GREEN}Cleanup session ended.${NC}"
 }
 
+# Sourced: define the functions above, run nothing.
+[[ "${BASH_SOURCE[0]}" != "$0" ]] && return 0
+
 # --- Handle command line arguments ---
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -1615,6 +2160,20 @@ while [[ $# -gt 0 ]]; do
             DRY_RUN=true
             shift
             ;;
+        --yes)
+            ASSUME_YES=true
+            shift
+            ;;
+        --only)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                ONLY_KEYS="$2"
+                shift 2
+            else
+                echo -e "${RED}Error: --only requires one or more cleanup keys (e.g. npm,nuget)${NC}"
+                echo "Use -h or --help for usage information"
+                exit 1
+            fi
+            ;;
         --flutter-dir)
             if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
                 # Expand ~ to home directory
@@ -1623,6 +2182,21 @@ while [[ $# -gt 0 ]]; do
                 shift 2
             else
                 echo -e "${RED}Error: --flutter-dir requires a directory path${NC}"
+                echo "Use -h or --help for usage information"
+                exit 1
+            fi
+            ;;
+        --projects-dir)
+            if [ -n "$2" ] && [ "${2:0:1}" != "-" ]; then
+                dir="${2/#\~/$HOME}"
+                if [ ! -d "$dir" ]; then
+                    echo -e "${RED}Error: Project directory does not exist: ${dir}${NC}"
+                    exit 1
+                fi
+                CLI_PROJECT_DIRS+=("$dir")
+                shift 2
+            else
+                echo -e "${RED}Error: --projects-dir requires a directory path${NC}"
                 echo "Use -h or --help for usage information"
                 exit 1
             fi
@@ -1640,6 +2214,13 @@ if [ "$FLUTTER_SEARCH_DIR" != "." ] && [ ! -d "$FLUTTER_SEARCH_DIR" ]; then
     echo -e "${RED}Error: Flutter search directory does not exist: ${FLUTTER_SEARCH_DIR}${NC}"
     echo "Please provide a valid directory path."
     exit 1
+fi
+
+resolve_project_roots "${CLI_PROJECT_DIRS[@]}"
+
+if [ -n "${ONLY_KEYS:-}" ]; then
+    run_only "$ONLY_KEYS"
+    exit $?
 fi
 
 # --- Initial check for user confirmation before starting the interactive menu ---
@@ -1670,6 +2251,22 @@ else
     echo -e "${FAINT}Flutter search directory: current directory (default)${NC}"
     echo ""
 fi
+
+# Report project directories (node_modules, .NET output, worktrees) and their source
+if [ "$PROJECTS_DIR_SOURCE" != "default" ]; then
+    echo -e "${CYAN}Project directories: ${PROJECT_ROOTS[*]}${NC}"
+    case "$PROJECTS_DIR_SOURCE" in
+        "environment")
+            echo -e "${FAINT}  (set via DEV_CLEANER_PROJECT_DIRS environment variable)${NC}"
+            ;;
+        "command-line")
+            echo -e "${FAINT}  (set via --projects-dir command-line argument)${NC}"
+            ;;
+    esac
+else
+    echo -e "${FAINT}Project directories: current directory (default)${NC}"
+fi
+echo ""
 
 if $DRY_RUN; then
     echo -e "${GREEN}✓ Safe to run: No files will be modified in dry-run mode.${NC}"

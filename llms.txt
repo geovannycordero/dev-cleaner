@@ -11,7 +11,10 @@
 - **One-Click Cleanup:** Clears caches for Xcode, Flutter, Gradle, npm, Homebrew, and browsers.
 - **Deep Flutter Integration:** Recursive search for `pubspec.yaml` to clean `build/`, `.dart_tool/`, and FVM caches.
 - **Mobile Dev Focused:** Specifically targets iOS (CocoaPods/DerivedData) and Android (Gradle/Build artifacts).
+- **Project Build Output:** Removes `node_modules` (next to `package.json`) and .NET `bin`/`obj`/`.vs` (next to project/solution files) under `--projects-dir` / `DEV_CLEANER_PROJECT_DIRS`.
+- **Git Worktrees:** Removes worktrees whose GitHub PR is merged (via `gh`), with confirmation; never dirty ones.
 - **Interactive:** Provides a menu to select specific cleanup targets.
+- **Unattended:** `--only <keys> --yes` runs selected cleanups without the menu.
 
 ## Installation & Usage
 
